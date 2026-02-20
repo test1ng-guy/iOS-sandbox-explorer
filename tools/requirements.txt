@@ -1,0 +1,12 @@
+# Core (cross-platform, no native dependencies)
+lief>=0.14.0
+
+# Optional: for device management and installation
+pymobiledevice3>=2.0.0
+
+# Optional: for advanced signing
+cryptography>=41.0.0
+# For Apple ID authentication (sign-apple command)
+requests>=2.28.0
+srp>=1.0.20
+pbkdf2>=1.3

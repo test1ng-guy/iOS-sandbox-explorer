@@ -1,10 +1,14 @@
-// ShellServer.m
+// ShellServer.m — TCP server for remote command execution
+// Binds to 127.0.0.1 (loopback only) for security
+// Compatible with iOS 14–26 sandbox
+
 #import "ShellServer.h"
 #import "ShellCommands.h"
 #import <sys/socket.h>
 #import <netinet/in.h>
 #import <arpa/inet.h>
 #import <unistd.h>
+#import <errno.h>
 
 @interface ShellServer ()
 
@@ -38,20 +42,29 @@
     
     self.serverSocket = socket(AF_INET, SOCK_STREAM, 0);
     if (self.serverSocket < 0) {
+        NSLog(@"[ShellServer] socket() failed: %s (errno=%d)", strerror(errno), errno);
         return;
     }
     
+    // Allow port reuse — prevents "Address already in use" after restart
+    int optval = 1;
+    setsockopt(self.serverSocket, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
+    
     struct sockaddr_in serverAddr;
+    memset(&serverAddr, 0, sizeof(serverAddr));
     serverAddr.sin_family = AF_INET;
-    serverAddr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    serverAddr.sin_addr.s_addr = inet_addr("127.0.0.1");  // Loopback only — safe in sandbox
     serverAddr.sin_port = htons(port);
     
     if (bind(self.serverSocket, (struct sockaddr *)&serverAddr, sizeof(serverAddr)) < 0) {
+        NSLog(@"[ShellServer] bind() failed on port %lu: %s (errno=%d)",
+              (unsigned long)port, strerror(errno), errno);
         close(self.serverSocket);
         return;
     }
     
     if (listen(self.serverSocket, 5) < 0) {
+        NSLog(@"[ShellServer] listen() failed: %s (errno=%d)", strerror(errno), errno);
         close(self.serverSocket);
         return;
     }
@@ -78,46 +91,94 @@
 }
 
 - (void)handleClient:(int)clientSocket {
-    char buffer[1024];
+    char buffer[4096];
     ssize_t bytesRead;
     
-    NSLog(@"New client connected");
+    NSLog(@"[ShellServer] Client connected");
     
-    bytesRead = read(clientSocket, buffer, sizeof(buffer) - 1);
-    if (bytesRead > 0) {
-        buffer[bytesRead] = '\0';
-        NSString *command = [NSString stringWithUTF8String:buffer];
-        command = [command stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    // Read command (accumulate until newline or EOF)
+    NSMutableData *commandData = [NSMutableData data];
+    while ((bytesRead = read(clientSocket, buffer, sizeof(buffer) - 1)) > 0) {
+        [commandData appendBytes:buffer length:bytesRead];
+        // Stop at newline
+        if (memchr(buffer, '\n', bytesRead)) break;
+    }
+    
+    if (commandData.length == 0) {
+        close(clientSocket);
+        return;
+    }
+    
+    NSString *command = [[NSString alloc] initWithData:commandData encoding:NSUTF8StringEncoding];
+    command = [command stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    
+    NSLog(@"[ShellServer] Command: %@", command);
+    
+    NSString *response;
+    
+    // Handle cd separately — it modifies server state
+    if ([command isEqualToString:@"cd"] || [command isEqualToString:@"cd ~"]) {
+        self.currentDirectory = NSHomeDirectory();
+        response = [NSString stringWithFormat:@"Changed directory to %@", self.currentDirectory];
+    } else if ([command hasPrefix:@"cd "]) {
+        NSString *target = [command substringFromIndex:3];
+        target = [target stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
         
-        NSLog(@"Received command: %@", command);
-        
-        NSString *response = [ShellCommands executeCommand:command inDirectory:self.currentDirectory];
-        
-        if ([command hasPrefix:@"cd "]) {
-            NSArray *parts = [command componentsSeparatedByString:@" "];
-            if (parts.count > 1) {
-                NSString *newDir = parts[1];
-                NSString *fullPath = [self.currentDirectory stringByAppendingPathComponent:newDir];
-                if ([[NSFileManager defaultManager] fileExistsAtPath:fullPath]) {
-                    self.currentDirectory = fullPath;
-                    response = [NSString stringWithFormat:@"Changed directory to %@", self.currentDirectory];
-                } else {
-                    response = @"Directory not found";
-                }
-            }
+        // Resolve path
+        NSString *fullPath;
+        if ([target hasPrefix:@"/"]) {
+            fullPath = target;
+        } else if ([target hasPrefix:@"~"]) {
+            fullPath = [NSHomeDirectory() stringByAppendingPathComponent:[target substringFromIndex:1]];
+        } else if ([target isEqualToString:@".."]  ) {
+            fullPath = [self.currentDirectory stringByDeletingLastPathComponent];
+        } else if ([target hasPrefix:@"../"]) {
+            fullPath = [[self.currentDirectory stringByDeletingLastPathComponent]
+                        stringByAppendingPathComponent:[target substringFromIndex:3]];
+        } else {
+            fullPath = [self.currentDirectory stringByAppendingPathComponent:target];
         }
         
-        write(clientSocket, [response UTF8String], [response length]);
-        NSLog(@"Sent response: %@", response);
+        fullPath = [fullPath stringByStandardizingPath];
+        
+        BOOL isDir = NO;
+        if ([[NSFileManager defaultManager] fileExistsAtPath:fullPath isDirectory:&isDir] && isDir) {
+            self.currentDirectory = fullPath;
+            response = [NSString stringWithFormat:@"Changed directory to %@", self.currentDirectory];
+        } else {
+            response = [NSString stringWithFormat:@"cd: %@: No such directory", target];
+        }
+    } else {
+        // All other commands
+        response = [ShellCommands executeCommand:command inDirectory:self.currentDirectory];
+    }
+    
+    // Send response
+    const char *responseBytes = [response UTF8String];
+    NSUInteger responseLen = [response lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+    NSUInteger totalWritten = 0;
+    
+    while (totalWritten < responseLen) {
+        ssize_t written = write(clientSocket, responseBytes + totalWritten,
+                                responseLen - totalWritten);
+        if (written < 0) {
+            NSLog(@"[ShellServer] write() error: %s", strerror(errno));
+            break;
+        }
+        totalWritten += written;
     }
     
     close(clientSocket);
-    NSLog(@"Client disconnected");
+    NSLog(@"[ShellServer] Response sent (%lu bytes)", (unsigned long)totalWritten);
 }
 
 - (void)stopServer {
     self.isRunning = NO;
-    close(self.serverSocket);
+    if (self.serverSocket >= 0) {
+        close(self.serverSocket);
+        self.serverSocket = -1;
+    }
+    NSLog(@"[ShellServer] Server stopped");
 }
 
 @end
