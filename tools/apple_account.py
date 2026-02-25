@@ -31,9 +31,15 @@ from typing import Optional
 
 try:
     import requests
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 except ImportError:
     print("[!] 'requests' not installed. Run: pip install requests")
     sys.exit(1)
+
+# Module-level session with SSL verification disabled (handles self-signed certs)
+_session = requests.Session()
+_session.verify = False
 
 
 # ─── Constants ────────────────────────────────────────────────────────────────
@@ -73,7 +79,7 @@ class AnisetteProvider:
     def fetch(self) -> dict:
         """Fetch fresh anisette data from omnisette-server."""
         try:
-            r = requests.get(self.server_url, timeout=10)
+            r = _session.get(self.server_url, timeout=10)
             r.raise_for_status()
             data = r.json()
         except requests.ConnectionError:
@@ -126,10 +132,39 @@ class AnisetteProvider:
     def check_server(url: str = DEFAULT_ANISETTE_URL) -> bool:
         """Check if anisette server is reachable."""
         try:
-            r = requests.get(url, timeout=3)
+            r = _session.get(url, timeout=3)
             return r.status_code == 200
         except Exception:
             return False
+
+
+def _parse_spd_plist(data: bytes) -> dict:
+    """
+    Parse Apple's SPD (Server Provided Data) as plist.
+    Apple sometimes returns a bare <dict>...</dict> without the
+    standard <?xml?> + <plist> wrapper; handle both cases.
+    """
+    try:
+        return plistlib.loads(data)
+    except Exception:
+        pass
+
+    # Strip leading/trailing whitespace or null bytes
+    stripped = data.strip(b'\x00').strip()
+
+    # If it starts with <dict>, wrap it with proper plist XML envelope
+    if stripped.startswith(b'<dict>'):
+        wrapped = (
+            b'<?xml version="1.0" encoding="UTF-8"?>\n'
+            b'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+            b'"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+            b'<plist version="1.0">\n'
+            + stripped +
+            b'\n</plist>'
+        )
+        return plistlib.loads(wrapped)
+
+    raise ValueError(f"Cannot parse SPD plist, first 64 bytes: {data[:64]!r}")
 
 
 # ─── Apple GSA Authentication ────────────────────────────────────────────────
@@ -161,7 +196,7 @@ class AppleAuth:
                 "SRP library not installed. Run: pip install srp"
             )
 
-    def _gsa_request(self, params: dict) -> dict:
+    def _gsa_request(self, params: dict, timeout: int = 30) -> dict:
         """Send authenticated request to GSA service."""
         body = {
             "Header": {"Version": "1.0.1"},
@@ -169,39 +204,47 @@ class AppleAuth:
         }
         body["Request"].update(params)
 
-        resp = requests.post(
+        req_data = plistlib.dumps(body, fmt=plistlib.FMT_XML)
+
+        resp = _session.post(
             GSA_URL,
             headers={
                 "Content-Type": "text/x-xml-plist",
-                "Accept": "*/*",
+                "Accept": "text/x-xml-plist",
                 "User-Agent": USER_AGENT_GSA,
                 "X-MMe-Client-Info": CLIENT_INFO,
             },
-            data=plistlib.dumps(body),
-            verify=True,
-            timeout=15,
+            data=req_data,
+            timeout=timeout,
         )
 
-        parsed = plistlib.loads(resp.content)
+        try:
+            parsed = plistlib.loads(resp.content)
+        except Exception:
+            # Show raw response to diagnose unexpected formats
+            preview = resp.content[:500].decode("utf-8", errors="replace")
+            raise Exception(
+                f"GSA returned non-plist response (HTTP {resp.status_code}):\n{preview}"
+            )
         return parsed.get("Response", parsed)
 
     @staticmethod
     def _encrypt_password(password: str, salt: bytes, iterations: int,
                           protocol: str = "s2k") -> bytes:
         """Derive SRP password using Apple's PBKDF2 scheme."""
-        import pbkdf2 as _pbkdf2
-
         p = hashlib.sha256(password.encode("utf-8")).digest()
 
         if protocol == "s2k_fo":
             # For newer accounts: hex-encode the SHA-256 digest
             p = p.hex().encode()
 
-        return _pbkdf2.PBKDF2(p, salt, iterations, hashlib.sha256).read(32)
+        # Use built-in hashlib.pbkdf2_hmac — avoids pbkdf2 library
+        # incompatibility with Python 3.14 (no digest_size on builtins)
+        return hashlib.pbkdf2_hmac("sha256", p, salt, iterations, dklen=32)
 
     @staticmethod
     def _decrypt_cbc(session_key: bytes, data: bytes) -> bytes:
-        """Decrypt AES-256-CBC encrypted server data."""
+        """Decrypt AES-256-CBC encrypted server data (et=2)."""
         from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
         from cryptography.hazmat.primitives import padding
 
@@ -214,6 +257,18 @@ class AppleAuth:
 
         unpadder = padding.PKCS7(128).unpadder()
         return unpadder.update(decrypted) + unpadder.finalize()
+
+    @staticmethod
+    def _decrypt_spd_gcm(session_key: bytes, data: bytes) -> bytes:
+        """Decrypt AES-256-GCM encrypted SPD (et=4, newer Apple accounts)."""
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+        key = hmac_mod.new(session_key, b"extra data key:", hashlib.sha256).digest()
+        # GCM uses 12-byte nonce (standard) derived the same way as CBC IV
+        nonce = hmac_mod.new(session_key, b"extra data iv:", hashlib.sha256).digest()[:12]
+
+        aes = AESGCM(key)
+        return aes.decrypt(nonce, data, None)
 
     @staticmethod
     def _decrypt_gcm(key: bytes, data: bytes) -> bytes:
@@ -237,7 +292,36 @@ class AppleAuth:
         """
         import srp._pysrp as _srp
 
-        usr = _srp.User(username, bytes(), hash_alg=_srp.SHA256, ng_type=_srp.NG_2048)
+        # Some versions of srp expose SHA256 as hashlib.sha256 (builtin function),
+        # which lacks .digest_size. Wrap it in a proper class.
+        class _SHA256:
+            digest_size = 32
+            block_size = 64
+
+            def __init__(self, data: bytes = b""):
+                self._h = hashlib.sha256(data)
+
+            def update(self, data: bytes):
+                self._h.update(data)
+
+            def digest(self) -> bytes:
+                return self._h.digest()
+
+            def hexdigest(self) -> str:
+                return self._h.hexdigest()
+
+            def copy(self):
+                obj = _SHA256()
+                obj._h = self._h.copy()
+                return obj
+
+        # Use integer constant if available (newer srp), else our wrapper
+        try:
+            sha256_alg = _srp.SHA256 if isinstance(_srp.SHA256, int) else _SHA256
+        except AttributeError:
+            sha256_alg = _SHA256
+
+        usr = _srp.User(username, bytes(), hash_alg=sha256_alg, ng_type=_srp.NG_2048)
         _, A = usr.start_authentication()
 
         # Step 1: Init
@@ -288,8 +372,32 @@ class AppleAuth:
         usr.verify_session(r2["M2"])
 
         # Decrypt server provided data
-        spd_bytes = self._decrypt_cbc(usr.get_session_key(), r2["spd"])
-        spd = plistlib.loads(spd_bytes)
+        # et=2: AES-CBC, et=4: AES-GCM (newer accounts)
+        sk = usr.get_session_key()
+        et = r2.get("et", 2)
+        spd_raw = r2["spd"]
+        print(f"[*] GSA: Decrypting spd (et={et}, {len(spd_raw)} bytes)...")
+
+        if et == 4:
+            spd_bytes = self._decrypt_spd_gcm(sk, spd_raw)
+        else:
+            spd_bytes = self._decrypt_cbc(sk, spd_raw)
+
+        # Fallback: try the other mode if first fails
+        try:
+            spd = _parse_spd_plist(spd_bytes)
+        except Exception:
+            try:
+                if et == 4:
+                    spd_bytes = self._decrypt_cbc(sk, spd_raw)
+                else:
+                    spd_bytes = self._decrypt_spd_gcm(sk, spd_raw)
+                spd = _parse_spd_plist(spd_bytes)
+            except Exception as e2:
+                raise Exception(
+                    f"spd decrypt failed (et={et}). "
+                    f"First 64 decrypted bytes: {spd_bytes[:64].hex()}"
+                ) from e2
 
         self.adsid = spd["adsid"]
         self.idms_token = spd["GsIdmsToken"]
@@ -338,7 +446,7 @@ class AppleAuth:
         """Trigger 2FA push notification to trusted devices."""
         print("[*] 2FA: Sending push to trusted devices...")
         headers = self._2fa_headers()
-        requests.get(
+        _session.get(
             "https://gsa.apple.com/auth/verify/trusteddevice",
             headers=headers,
             timeout=15,
@@ -351,7 +459,7 @@ class AppleAuth:
         headers = self._2fa_headers()
         headers["security-code"] = code
 
-        resp = requests.get(
+        resp = _session.get(
             "https://gsa.apple.com/grandslam/GsService2/validate",
             headers=headers,
             timeout=15,
@@ -381,7 +489,7 @@ class AppleAuth:
         headers = self._2fa_headers()
         headers["Content-Type"] = "application/json"
 
-        requests.put(
+        _session.put(
             "https://gsa.apple.com/auth/verify/phone/",
             headers=headers,
             json={"phoneNumber": {"id": phone_id}, "mode": "sms"},
@@ -395,7 +503,7 @@ class AppleAuth:
         headers = self._2fa_headers()
         headers["Content-Type"] = "application/json"
 
-        resp = requests.post(
+        resp = _session.post(
             "https://gsa.apple.com/auth/verify/phone/securitycode",
             headers=headers,
             json={
@@ -430,14 +538,25 @@ class AppleAuth:
         checksum = h.digest()
 
         print("[*] Requesting Xcode token...")
-        r = self._gsa_request({
-            "u": self.adsid,
-            "app": [app_id],
-            "c": self.cookie,
-            "t": self.idms_token,
-            "checksum": checksum,
-            "o": "apptokens",
-        })
+        last_err = None
+        for attempt in range(3):
+            try:
+                r = self._gsa_request({
+                    "u": self.adsid,
+                    "app": [app_id],
+                    "c": self.cookie,
+                    "t": self.idms_token,
+                    "checksum": checksum,
+                    "o": "apptokens",
+                }, timeout=45)
+                break
+            except Exception as e:
+                last_err = e
+                print(f"[!] Xcode token attempt {attempt+1}/3 failed: {e}")
+                if attempt < 2:
+                    time.sleep(3)
+        else:
+            raise Exception(f"Xcode token request failed after 3 attempts: {last_err}")
 
         status = r.get("Status", {})
         ec = status.get("ec", -1)
@@ -451,11 +570,23 @@ class AppleAuth:
             raise Exception("No encrypted token in response")
 
         token_plist_bytes = self._decrypt_gcm(self.session_key, et)
-        token_plist = plistlib.loads(token_plist_bytes)
+        token_plist = _parse_spd_plist(token_plist_bytes)
+
+        print(f"[dbg] token_plist keys: {list(token_plist.keys())}")
+        t_dict = token_plist.get("t", {})
+        print(f"[dbg] t dict keys: {list(t_dict.keys())}")
+        if app_id in t_dict:
+            print(f"[dbg] app token keys: {list(t_dict[app_id].keys())}")
 
         token = token_plist.get("t", {}).get(app_id, {}).get("token")
         if not token:
             raise Exception("Xcode token not found in decrypted response")
+
+        # Ensure token is a str (plist may decode it as bytes if stored as <data>)
+        if isinstance(token, bytes):
+            token = token.decode("utf-8")
+
+        print(f"[*] Xcode token type: {type(token).__name__}, length: {len(token)}, preview: {str(token)[:40]}")
 
         self.xcode_token = token
         print("[+] Xcode token obtained")
@@ -502,31 +633,40 @@ class DeveloperPortal:
             "X-Apple-GS-Token": self.auth.xcode_token,
             "X-Xcode-Version": XCODE_VERSION,
             "X-Apple-App-Info": "com.apple.gs.xcode.auth",
+            "X-MMe-Client-Info": CLIENT_INFO,
         }
         headers.update(self.auth.anisette.generate_headers())
 
-        resp = requests.post(
+        resp = _session.post(
             url,
             headers=headers,
-            data=plistlib.dumps(body),
-            verify=True,
-            timeout=20,
+            data=plistlib.dumps(body, fmt=plistlib.FMT_XML),
+            timeout=45,
         )
 
-        result = plistlib.loads(resp.content)
+        try:
+            result = plistlib.loads(resp.content)
+        except Exception:
+            raise Exception(
+                f"Developer Portal non-plist response (HTTP {resp.status_code}):\n"
+                f"{resp.content[:500].decode('utf-8', errors='replace')}"
+            )
+
+        print(f"[dbg] Portal {action} → HTTP {resp.status_code}, resultCode={result.get('resultCode', 0)}")
 
         # Check for errors
         rc = result.get("resultCode", 0)
         if rc != 0:
             rm = result.get("resultString", "")
             ue = result.get("userString", rm)
+            print(f"[!] Dev Portal raw response: {dict(list(result.items())[:10])}")
             raise Exception(f"Developer Portal error ({rc}): {ue}")
 
         return result
 
     def list_teams(self) -> list:
         """List development teams associated with this Apple ID."""
-        r = self._request("listTeams.action", device_type="")
+        r = self._request("listTeams.action", device_type=None)
         teams = r.get("teams", [])
         if not teams:
             raise Exception("No development teams found")
@@ -634,14 +774,21 @@ class DeveloperPortal:
     def revoke_certificate(self, serial_number: str):
         """Revoke a development certificate by serial number."""
         print(f"[*] Revoking certificate: {serial_number}")
-        self._request("revokeDevelopmentCert.action", {
-            "teamId": self.team_id,
-            "serialNumber": serial_number,
-        })
-        print(f"[+] Certificate revoked")
+        try:
+            self._request("revokeDevelopmentCert.action", {
+                "teamId": self.team_id,
+                "serialNumber": serial_number,
+            })
+            print(f"[+] Certificate revoked")
+        except Exception as e:
+            # 7252 = cert not found (already revoked or from another session) — OK
+            if "(7252)" in str(e):
+                print(f"[*] Certificate already gone (7252)")
+            else:
+                raise
 
-    def add_app_id(self, bundle_id: str, name: str) -> dict:
-        """Register a new App ID."""
+    def add_app_id(self, bundle_id: str, name: str) -> tuple:
+        """Register a new App ID. Returns (app_id_dict, actual_bundle_id)."""
         print(f"[*] Creating App ID: {bundle_id}")
         try:
             r = self._request("addAppId.action", {
@@ -650,11 +797,31 @@ class DeveloperPortal:
                 "name": name,
             })
             print(f"[+] App ID created: {bundle_id}")
-            return r.get("appId", {})
+            return r.get("appId", {}), bundle_id
         except Exception as e:
-            if "already exists" in str(e).lower() or "is not available" in str(e).lower():
+            err = str(e)
+            # Already registered in THIS team
+            if "already exists" in err.lower():
                 print(f"[*] App ID already exists, reusing")
-                return self.find_app_id(bundle_id)
+                return self.find_app_id(bundle_id), bundle_id
+            # Bundle ID taken by ANOTHER team (9401) — prefix with team ID
+            if "(9401)" in err or "is not available" in err.lower():
+                alt_bundle = f"{self.team_id}.{bundle_id}"
+                print(f"[!] Bundle ID '{bundle_id}' is taken by another developer")
+                print(f"[*] Trying team-prefixed bundle ID: {alt_bundle}")
+                try:
+                    r2 = self._request("addAppId.action", {
+                        "teamId": self.team_id,
+                        "identifier": alt_bundle,
+                        "name": name,
+                    })
+                    print(f"[+] App ID created: {alt_bundle}")
+                    return r2.get("appId", {}), alt_bundle
+                except Exception as e2:
+                    if "already exists" in str(e2).lower() or "is not available" in str(e2).lower():
+                        print(f"[*] Alternative App ID already exists, reusing")
+                        return self.find_app_id(alt_bundle), alt_bundle
+                    raise
             raise
 
     def list_app_ids(self) -> list:
@@ -785,35 +952,76 @@ class AppleSigner:
         # Register device
         self.portal.register_device(app_name + " Device", udid)
 
-        # Check existing certificates (free accounts limited to 2)
+        # Revoke all existing dev certs — free accounts allow only 1 at a time
         certs = self.portal.list_certificates()
-        if len(certs) >= 2:
-            print(f"[!] Max certificates reached ({len(certs)}). Revoking oldest...")
-            oldest = sorted(certs, key=lambda c: c.get("dateCreated", ""))
-            self.portal.revoke_certificate(oldest[0]["serialNumber"])
+        if certs:
+            print(f"[!] Revoking {len(certs)} existing certificate(s) to free slot...")
+            for cert in sorted(certs, key=lambda c: c.get("dateCreated", "")):
+                self.portal.revoke_certificate(cert["serialNumber"])
 
-        # Generate key pair + CSR
+        # Generate key pair + CSR, get cert from response directly
         self._private_key, csr_pem = self.portal.generate_csr()
-        self.portal.submit_csr(csr_pem)
+        cert_info = self.portal.submit_csr(csr_pem)
 
-        # Get the certificate we just created
-        certs = self.portal.list_certificates()
-        cert_der = None
-        for cert in certs:
-            if cert.get("machineName") == "IOSSandboxExplorer":
-                cert_der = cert.get("certContent")
-                break
-        if cert_der is None and certs:
-            cert_der = certs[-1].get("certContent")
+        # Decode certContent — may be bytes (DER) or base64 string
+        def _decode_cert(raw):
+            if not raw:
+                return None
+            if isinstance(raw, bytes):
+                return raw
+            if isinstance(raw, str):
+                import base64 as _b64
+                try:
+                    return _b64.b64decode(raw)
+                except Exception:
+                    pass
+            return None
+
+        cert_der = _decode_cert(cert_info.get("certContent"))
+        print(f"[dbg] submit_csr certContent: {type(cert_info.get('certContent')).__name__}, "
+              f"len={len(cert_info.get('certContent', b''))}")
+
+        if not cert_der:
+            # fallback: list certs and match by public key
+            import time as _time
+            _time.sleep(1)
+            certs = self.portal.list_certificates()
+            print(f"[dbg] list_certificates returned {len(certs)} cert(s)")
+            # Try to find the cert that matches our private key
+            from cryptography import x509 as _x509
+            our_pub = self._private_key.public_key().public_bytes(
+                serialization.Encoding.DER,
+                serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+            for c in reversed(certs):  # newest last
+                raw = _decode_cert(c.get("certContent"))
+                if not raw:
+                    continue
+                try:
+                    loaded = _x509.load_der_x509_certificate(raw)
+                    cpub = loaded.public_key().public_bytes(
+                        serialization.Encoding.DER,
+                        serialization.PublicFormat.SubjectPublicKeyInfo,
+                    )
+                    if cpub == our_pub:
+                        cert_der = raw
+                        print(f"[+] Matched cert by public key")
+                        break
+                except Exception:
+                    pass
+            if not cert_der and certs:
+                cert_der = _decode_cert(certs[-1].get("certContent"))
+                print(f"[!] Using latest cert (no key match found)")
 
         # Create App ID
-        app_id = self.portal.add_app_id(bundle_id, app_name)
+        app_id, actual_bundle_id = self.portal.add_app_id(bundle_id, app_name)
         if not app_id:
             app_id = self.portal.find_app_id(bundle_id)
+            actual_bundle_id = bundle_id
 
         app_id_id = app_id.get("appIdId")
         if not app_id_id:
-            raise Exception(f"Could not find appIdId for {bundle_id}")
+            raise Exception(f"Could not find appIdId for {actual_bundle_id}")
 
         # Download provisioning profile
         profile_bytes = self.portal.download_provisioning_profile(app_id_id)
@@ -827,12 +1035,247 @@ class AppleSigner:
 
         print("[+] Provisioning complete!")
         print(f"    Team ID:    {self.portal.team_id}")
-        print(f"    Bundle ID:  {bundle_id}")
+        print(f"    Bundle ID:  {actual_bundle_id}" +
+              (f" (orig: {bundle_id})" if actual_bundle_id != bundle_id else ""))
         print(f"    Device:     {udid[:12]}...")
         print(f"    Profile:    {len(profile_bytes)} bytes")
         print(f"    Cert:       {len(cert_der) if cert_der else 0} bytes")
 
-        return private_key_pem, profile_bytes, cert_der
+        return private_key_pem, profile_bytes, cert_der, actual_bundle_id
+
+    def _sign_with_codesign(self, ipa_path: str, output_path: str,
+                             private_key_pem: bytes, cert_der: bytes,
+                             profile_path: str,
+                             temp_dir: Path) -> bool:
+        """Sign IPA using macOS codesign with a temporary keychain."""
+        import subprocess
+        import zipfile as zf
+
+        sign_dir = temp_dir / "sign_work"
+        sign_dir.mkdir(exist_ok=True)
+        kc_path = str(temp_dir / "tmp.keychain-db")
+        kc_pass = "tmp_kc_pass_12345"
+        p12_pass = "tmp_p12_12345"
+
+        try:
+            # 1. Create temp keychain and import p12 (must have non-empty password for macOS import)
+            # Use openssl to create a legacy-compatible p12 (macOS security import needs RC2/3DES)
+            import subprocess as _sp
+            key_pem_path = str(temp_dir / "key.pem")
+            cert_pem_path = str(temp_dir / "cert.pem")
+            p12_enc_path = str(temp_dir / "cert_enc.p12")
+            with open(key_pem_path, "wb") as f:
+                f.write(private_key_pem)
+            # Convert DER cert to PEM
+            from cryptography import x509 as _x509
+            if not cert_der.startswith(b"-----"):
+                cert_obj = _x509.load_der_x509_certificate(cert_der)
+                from cryptography.hazmat.primitives.serialization import Encoding as _Enc
+                cert_pem = cert_obj.public_bytes(_Enc.PEM)
+            else:
+                cert_pem = cert_der
+            with open(cert_pem_path, "wb") as f:
+                f.write(cert_pem)
+            _sp.run([
+                "/usr/bin/openssl", "pkcs12", "-export",
+                "-out", p12_enc_path,
+                "-inkey", key_pem_path,
+                "-in", cert_pem_path,
+                "-passout", f"pass:{p12_pass}",
+                "-legacy",
+            ], check=True, capture_output=True)
+            if not Path(p12_enc_path).exists():
+                raise RuntimeError("openssl pkcs12 -legacy failed, trying without")
+        except Exception as _e1:
+            # Try without -legacy flag (older openssl)
+            try:
+                _sp.run([
+                    "/usr/bin/openssl", "pkcs12", "-export",
+                    "-out", p12_enc_path,
+                    "-inkey", key_pem_path,
+                    "-in", cert_pem_path,
+                    "-passout", f"pass:{p12_pass}",
+                ], check=True, capture_output=True)
+            except Exception as _e2:
+                print(f"[!] openssl pkcs12 also failed: {_e2}")
+                return False
+            subprocess.run(["security", "create-keychain", "-p", kc_pass, kc_path],
+                           check=True, capture_output=True)
+            subprocess.run(["security", "unlock-keychain", "-p", kc_pass, kc_path],
+                           check=True, capture_output=True)
+            subprocess.run(["security", "set-keychain-settings", "-lut", "7200", kc_path],
+                           check=True, capture_output=True)
+            subprocess.run(["security", "import", p12_enc_path, "-k", kc_path,
+                            "-P", p12_pass, "-T", "/usr/bin/codesign",
+                            "-T", "/usr/bin/security", "-A"],
+                           check=True, capture_output=True)
+            subprocess.run(["security", "set-key-partition-list",
+                            "-S", "apple-tool:,apple:,codesign:", "-s",
+                            "-k", kc_pass, kc_path],
+                           check=True, capture_output=True)
+
+            # Add to search list
+            current_kcs = subprocess.run(
+                ["security", "list-keychains", "-d", "user"],
+                capture_output=True, text=True
+            ).stdout.strip().replace('"', '').split()
+            subprocess.run(["security", "list-keychains", "-d", "user", "-s",
+                            kc_path] + current_kcs, capture_output=True)
+
+            # 2. Find certificate identity (SHA1 hash is most reliable)
+            out = subprocess.run(
+                ["security", "find-identity", "-v", kc_path],
+                capture_output=True, text=True
+            ).stdout
+            identity = None
+            for line in out.splitlines():
+                # Line format: "  1) AABBCCDD... "Some Name""
+                import re as _re
+                m = _re.search(r'\)\s+([0-9A-Fa-f]{40})', line)
+                if m:
+                    identity = m.group(1)
+                    print(f"[*] Signing identity SHA1: {identity[:8]}...")
+                    break
+            if not identity:
+                print(f"[!] No valid identity found. security output:\n{out}")
+                return False
+
+            # 3. Unzip IPA
+            with zf.ZipFile(ipa_path, 'r') as z:
+                z.extractall(str(sign_dir))
+
+            # 4. Find .app
+            payload = sign_dir / "Payload"
+            apps = list(payload.glob("*.app"))
+            if not apps:
+                print("[!] No .app found in IPA")
+                return False
+            app_path = apps[0]
+
+            # 5. Copy provisioning profile
+            import shutil as _sh
+            _sh.copy2(profile_path, str(app_path / "embedded.mobileprovision"))
+
+            # 6. Extract entitlements from profile
+            ent_path = str(temp_dir / "entitlements.plist")
+            with open(profile_path, "rb") as f:
+                mp_data = f.read()
+            try:
+                start = mp_data.index(b"<?xml")
+                end = mp_data.index(b"</plist>") + len(b"</plist>")
+                mp_plist = plistlib.loads(mp_data[start:end])
+                ents = mp_plist.get("Entitlements", {})
+                with open(ent_path, "wb") as f:
+                    plistlib.dump(ents, f, fmt=plistlib.FMT_XML)
+            except Exception:
+                ent_path = None
+
+            # 7. Sign frameworks and dylibs first (inside-out)
+            def _cs(path, with_ents=False):
+                cmd = ["codesign", "--force", "--sign", identity,
+                       "--keychain", kc_path, "--timestamp=none"]
+                if with_ents and ent_path:
+                    cmd += ["--entitlements", ent_path]
+                cmd.append(str(path))
+                r = subprocess.run(cmd, capture_output=True, text=True)
+                if r.returncode != 0:
+                    print(f"  [!] codesign {Path(path).name}: {r.stderr.strip()[:120]}")
+
+            # Frameworks (no entitlements)
+            fw_dir = app_path / "Frameworks"
+            if fw_dir.exists():
+                for fw in sorted(fw_dir.iterdir()):
+                    if fw.suffix in (".framework", ".dylib"):
+                        _cs(fw)
+
+            # PlugIns (no entitlements)
+            plugins_dir = app_path / "PlugIns"
+            if plugins_dir.exists():
+                for plugin in sorted(plugins_dir.glob("*.appex")):
+                    _cs(plugin)
+
+            # Main app (with entitlements)
+            _cs(app_path, with_ents=True)
+
+            # 8. Repack to IPA preserving Unix permissions from original zip
+            print(f"[*] Repacking IPA → {output_path}")
+            # Build map: arcname → original external_attr (contains Unix mode)
+            orig_attrs = {}
+            with zf.ZipFile(ipa_path, 'r') as zorig:
+                for info in zorig.infolist():
+                    orig_attrs[info.filename] = info.external_attr
+
+            import os as _os
+
+            # Name of the main binary (same as .app bundle name without extension)
+            app_binary_name = app_path.name.replace('.app', '')
+
+            # MachO magic bytes (fat, arm64, x86_64)
+            _MACHO_MAGIC = {b'\xca\xfe\xba\xbe', b'\xcf\xfa\xed\xfe',
+                            b'\xce\xfa\xed\xfe', b'\xfe\xed\xfa\xcf', b'\xfe\xed\xfa\xce'}
+
+            def _is_macho(path):
+                try:
+                    with open(path, 'rb') as _f:
+                        return _f.read(4) in _MACHO_MAGIC
+                except Exception:
+                    return False
+
+            with zf.ZipFile(output_path, 'w', compression=zf.ZIP_DEFLATED) as zout:
+                for f in sorted(sign_dir.rglob("*")):
+                    if f.is_file():
+                        arcname = str(f.relative_to(sign_dir)).replace(_os.sep, '/')
+                        zi = zf.ZipInfo(arcname)
+                        zi.compress_type = zf.ZIP_DEFLATED
+                        # MachO binaries (main + frameworks + plugins + dylibs) → 0755
+                        if _is_macho(f) or f.suffix == '.dylib':
+                            zi.external_attr = 0o100755 << 16
+                        else:
+                            zi.external_attr = 0o100644 << 16
+                        with open(f, 'rb') as fp:
+                            zout.writestr(zi, fp.read())
+
+            print(f"[+] Signed IPA: {output_path}")
+            return True
+
+        except subprocess.CalledProcessError as e:
+            print(f"[!] codesign step failed: {e.stderr.decode() if e.stderr else e}")
+            return False
+        finally:
+            # Remove our keychain from search list
+            try:
+                current = subprocess.run(
+                    ["security", "list-keychains", "-d", "user"],
+                    capture_output=True, text=True
+                ).stdout.strip().replace('"', '').split()
+                remaining = [k for k in current if k != kc_path]
+                subprocess.run(["security", "list-keychains", "-d", "user", "-s"]
+                               + remaining, capture_output=True)
+                subprocess.run(["security", "delete-keychain", kc_path],
+                               capture_output=True)
+            except Exception:
+                pass
+
+    def _patch_ipa_bundle_id(self, ipa_path: str, old_id: str, new_id: str, work_dir: str) -> str:
+        """Replace bundle ID in IPA's Info.plist and return path to patched IPA."""
+        import zipfile, shutil
+        patched_path = str(Path(work_dir) / "patched_bundleid.ipa")
+        with zipfile.ZipFile(ipa_path, 'r') as zin:
+            with zipfile.ZipFile(patched_path, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    data = zin.read(item.filename)
+                    # Patch Info.plist inside Payload/*.app/
+                    if item.filename.endswith('/Info.plist') and item.filename.count('/') == 2:
+                        try:
+                            pl = plistlib.loads(data)
+                            if pl.get('CFBundleIdentifier') == old_id:
+                                pl['CFBundleIdentifier'] = new_id
+                                data = plistlib.dumps(pl, fmt=plistlib.FMT_XML)
+                                print(f"[+] Patched Info.plist: {old_id} → {new_id}")
+                        except Exception:
+                            pass
+                    zout.writestr(item, data)
+        return patched_path
 
     def create_p12(self, private_key_pem: bytes, cert_der: bytes,
                    output_path: str, password: str = "") -> str:
@@ -840,6 +1283,7 @@ class AppleSigner:
         Create .p12 (PKCS#12) file from private key and certificate.
         For use with zsign.
         """
+        from cryptography.hazmat.primitives import serialization
         from cryptography.hazmat.primitives.serialization import (
             Encoding, PrivateFormat, pkcs12, BestAvailableEncryption,
             NoEncryption,
@@ -899,13 +1343,20 @@ class AppleSigner:
                 udid = input("Enter device UDID: ").strip()
 
         # Provision
-        private_key_pem, profile_bytes, cert_der = self.provision(
+        private_key_pem, profile_bytes, cert_der, actual_bundle_id = self.provision(
             udid, bundle_id, app_name
         )
 
         # Create temp files for signing
         temp_dir = Path(tempfile.mkdtemp(prefix="apple_sign_"))
         try:
+            # If bundle ID was changed (9401: taken by another dev), patch IPA
+            if actual_bundle_id != bundle_id:
+                print(f"[*] Patching IPA bundle ID: {bundle_id} → {actual_bundle_id}")
+                ipa_path = self._patch_ipa_bundle_id(
+                    ipa_path, bundle_id, actual_bundle_id, str(temp_dir)
+                )
+                bundle_id = actual_bundle_id
             p12_path = str(temp_dir / "cert.p12")
             profile_path = str(temp_dir / "profile.mobileprovision")
 
@@ -936,28 +1387,37 @@ class AppleSigner:
                     print(f"[*] Manual signing files saved in: {temp_dir}")
                     return ""
             else:
-                # No zsign — save files for user to sign manually
-                final_p12 = ipa_path.replace(".ipa", "_cert.p12")
-                final_profile = ipa_path.replace(".ipa", ".mobileprovision")
+                # No zsign — try macOS codesign (macOS-only, works for dev signing)
+                if shutil.which("codesign") and shutil.which("security"):
+                    signed = self._sign_with_codesign(
+                        ipa_path, output_path, private_key_pem, cert_der,
+                        profile_path, temp_dir
+                    )
+                    if signed:
+                        return output_path
+
+                # Final fallback — save files to workspace dir for manual use
+                ws = Path(output_path).parent
+                final_p12 = str(ws / "diia_cert.p12")
+                final_profile = str(ws / "diia.mobileprovision")
+                final_ipa = str(ws / "diia_patched_bundleid.ipa")
                 shutil.copy2(p12_path, final_p12)
                 shutil.copy2(profile_path, final_profile)
+                if Path(ipa_path).resolve() != Path(final_ipa).resolve():
+                    shutil.copy2(ipa_path, final_ipa)
 
                 print()
                 print("=" * 60)
-                print("[!] zsign not found — saved signing materials:")
-                print(f"    Certificate: {final_p12}")
-                print(f"    Profile:     {final_profile}")
+                print("[+] Signing materials saved to workspace:")
+                print(f"    Certificate:  {final_p12}")
+                print(f"    Profile:      {final_profile}")
+                print(f"    Patched IPA:  {final_ipa}")
                 print()
-                print("    Install zsign to sign from CLI:")
-                print("      git clone https://github.com/nicetransistor/zSign.git")
-                print("      cd zSign && make && sudo cp zsign /usr/local/bin/")
-                print()
-                print("    Then sign manually:")
-                print(f"      zsign -k {final_p12} -m {final_profile} -o {output_path} {ipa_path}")
-                print()
-                print("    Or use Sideloadly with these files.")
+                print("    Sign with Sideloadly using the .p12 + .mobileprovision")
+                print("    Or install zsign and run:")
+                print(f"      zsign -k {final_p12} -m {final_profile} -o {output_path} {final_ipa}")
                 print("=" * 60)
-                return ""
+                return final_ipa
 
         finally:
             # Clean up temp dir (but preserve if signing failed without zsign)
@@ -1089,6 +1549,39 @@ def sign_ipa_with_apple_id(
     return signer.sign_ipa(ipa_path, output_path, udid, bundle_id)
 
 
+def install_ipa_on_device(ipa_path: str, udid: str = None) -> bool:
+    """
+    Install IPA on a connected iOS device using ideviceinstaller.
+    Returns True on success.
+    """
+    import shutil
+    import subprocess as _sp
+
+    tool = shutil.which("ideviceinstaller")
+    if not tool:
+        print()
+        print("[!] ideviceinstaller not found.")
+        print("    macOS:  brew install ideviceinstaller")
+        print("    Linux:  apt install ideviceinstaller  (or build from source)")
+        print("    Win:    https://github.com/libimobiledevice-win32")
+        return False
+
+    cmd = [tool]
+    if udid:
+        cmd += ["-u", udid]
+    cmd += ["install", ipa_path]
+
+    print()
+    print(f"[*] Installing {ipa_path} on device{' ' + udid[:12] + '...' if udid else ''}...")
+    result = _sp.run(cmd, text=True)
+    if result.returncode == 0:
+        print("[+] Installation complete!")
+        return True
+    else:
+        print(f"[!] ideviceinstaller failed (exit {result.returncode})")
+        return False
+
+
 # ─── Standalone Usage ────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -1125,6 +1618,8 @@ Examples:
                         help="Anisette server URL")
     p_sign.add_argument("--skip-sign", action="store_true",
                         help="Skip signing (for paranoid users)")
+    p_sign.add_argument("--install", action="store_true",
+                        help="Install signed IPA on device via ideviceinstaller after signing")
 
     # provision
     p_prov = sub.add_parser("provision", help="Generate cert + profile only")
@@ -1173,6 +1668,8 @@ Examples:
         )
         if not result:
             sys.exit(1)
+        if args.install:
+            install_ipa_on_device(result, udid=args.udid)
 
     elif args.command == "provision":
         signer = interactive_login(args.anisette_url)
@@ -1181,7 +1678,7 @@ Examples:
 
         from cryptography.hazmat.primitives import serialization
 
-        pk_pem, profile_bytes, cert_der = signer.provision(
+        pk_pem, profile_bytes, cert_der, actual_bundle_id = signer.provision(
             args.udid, args.bundle_id, args.bundle_id.split(".")[-1]
         )
 

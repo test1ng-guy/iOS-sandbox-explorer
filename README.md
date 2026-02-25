@@ -1,34 +1,64 @@
-# iOS DYLIB Injection Tool for Non-Jailbreak Devices
+# iOS Sandbox Explorer
 
-This project provides a complete solution for injecting a custom dynamic library (DYLIB) into iOS apps on non-jailbreak devices. The injected DYLIB runs a TCP server on port 8080, allowing remote shell-like commands and file downloads via USB tunneling.
+Inject a custom DYLIB into any iOS app, sign it with a **free Apple ID** (no paid developer account), install it, and get interactive shell access to the app's sandbox over USB — on any device, jailbroken or not.
 
-## Features
+Built-in signing works the same way as **Sideloadly**: authenticates directly with Apple using SRP, obtains a free development certificate and provisioning profile, and signs your IPA — entirely from the command line on Windows, Linux, or macOS.
 
-- TCP server on port 8080 for remote command execution
-- Shell-like commands: ls, pwd, id, uname, whoami, echo, cp
-- Recursive file/directory download with automatic base64 encoding/decoding
-- Works within app sandbox on non-jailbreak iOS devices
-- USB tunneling via iproxy for secure connection
+## How It Works
+
+1. **Build** `libShell.dylib` — an Objective-C TCP server with 38 built-in sandbox-safe commands (no `popen`, no `exec`)
+2. **Patch** any IPA — inject the DYLIB, add network entitlements, update `Info.plist`
+3. **Sign** with a free Apple ID — no paid account, no Xcode GUI, works cross-platform
+4. **Install** directly to device via `ideviceinstaller`
+5. **Connect** via USB tunnel → run commands, download files from the app's sandbox
+
+## Architecture
+
+```
+src/
+  main.m              — DYLIB entry point, starts TCP server
+  ShellServer.m       — TCP server (port 8080)
+  ShellCommands.m     — 38 built-in commands (sandbox-safe, no popen)
+include/
+  ShellServer.h
+  ShellCommands.h
+tools/
+  patcher.py          — Cross-platform IPA patcher (Windows / Linux / macOS)
+  apple_account.py    — Apple ID auth & signing (like Sideloadly, no paid account)
+ios-patch/
+  patch_ipa.sh        — Legacy macOS patching script
+client.py             — Python client for remote command execution
+Makefile              — Builds libShell.dylib
+```
 
 ## Prerequisites
 
-- macOS with Xcode Command Line Tools: `xcode-select --install`
-- Python 3: `brew install python`
-- Apple Developer Account with valid signing identity
-- iOS device connected via USB
-- iproxy for USB tunneling: `brew install libimobiledevice`
+### Required
 
-### Building insert_dylib
+- Python 3.8+
+- `pip install -r tools/requirements.txt`
 
-The patching script requires `insert_dylib` tool:
+### For USB install / tunneling
 
 ```bash
-git clone https://github.com/Tyilo/insert_dylib.git insert_dylib_repo
-cd insert_dylib_repo
-xcodebuild -project insert_dylib.xcodeproj -configuration Release
+brew install libimobiledevice ideviceinstaller   # macOS
+apt install libimobiledevice-utils ideviceinstaller  # Debian/Ubuntu
 ```
 
-The built binary will be at `insert_dylib_repo/build/Release/insert_dylib`.
+### For Apple ID signing
+
+Run [omnisette-server](https://github.com/SideStore/omnisette-server) — provides the anisette data Apple requires:
+
+```bash
+docker run -d --restart always --name omnisette \
+  -p 6969:80 \
+  --volume omnisette_data:/opt/omnisette-server/lib \
+  ghcr.io/sidestore/omnisette-server:latest
+```
+
+### For building the DYLIB (macOS only)
+
+- Xcode Command Line Tools: `xcode-select --install`
 
 ## Building the DYLIB
 
@@ -36,232 +66,135 @@ The built binary will be at `insert_dylib_repo/build/Release/insert_dylib`.
 make
 ```
 
-This creates `libShell.dylib` in the project root.
+Creates `libShell.dylib` in the project root. You only need macOS for this step — use the pre-built binary from Releases on other platforms.
 
 ## Patching an IPA
 
-Use the provided script to inject the DYLIB into your IPA:
-
 ```bash
-./ios-patch/patch_ipa.sh <ipa_path> <dylib_path> <insert_dylib_path> <signing_identity> [output_ipa]
+python3 tools/patcher.py patch --ipa MyApp.ipa --dylib libShell.dylib
+# → MyApp_patched.ipa
 ```
 
-### Finding Signing Identity
+Works on Windows, Linux, and macOS. No Xcode or `insert_dylib` required.
 
-List available identities:
+## Signing with Apple ID
 
-```bash
-security find-identity -p codesigning -v
-```
-
-Look for "Apple Development" identities.
-
-### Example
+### One command: patch + sign + install
 
 ```bash
-./ios-patch/patch_ipa.sh MyApp.ipa libShell.dylib insert_dylib_repo/build/Release/insert_dylib "Apple Development: Your Name (ABC123)" patched_MyApp.ipa
+python3 tools/patcher.py full \
+  --ipa MyApp.ipa \
+  --dylib libShell.dylib \
+  --install \
+  --udid <device-udid>
 ```
 
-The script will:
-- Unzip the IPA
-- Copy `libShell.dylib` to `Payload/App.app/Frameworks/`
-- Inject LC_LOAD_DYLIB into the app binary
-- Update Info.plist for network permissions
-- Create entitlements for network access
-- Sign the DYLIB and resign the binary
-- Repackage the IPA
+### Sign only (already patched IPA)
+
+```bash
+python3 tools/apple_account.py sign \
+  --ipa MyApp_patched.ipa \
+  -o MyApp_signed.ipa \
+  --udid <device-udid> \
+  --install
+```
+
+You will be prompted for your Apple ID email and password. The password is **never saved to disk** — authentication uses Apple's SRP protocol.
+
+**Free account limitations:**
+- Apps expire in 7 days (re-sign weekly)
+- Max 3 App IDs per week
+- Max 10 sideloaded apps
+
+**Note:** If the app's bundle ID is taken by another developer, the tool automatically renames it to `<TEAM_ID>.<bundle.id>` and patches `Info.plist` accordingly.
 
 ## Installing on Device
 
-Install the patched IPA using Sideloadly (recommended) or ios-deploy:
-
 ```bash
-# Using Sideloadly (GUI tool)
-# Open Sideloadly, select patched IPA, connect device, install
+# Standalone install (after signing)
+ideviceinstaller -u <device-udid> install MyApp_signed.ipa
 
-# Using ios-deploy (command line)
-ios-deploy --bundle Payload/MyApp.app -W -d
+# Or use --install flag during signing (see above)
 ```
 
-## Connecting and Usage
+## Connecting and Using
 
-1. Launch the patched app on your iOS device.
+### 1. Launch the patched app on your device
 
-2. Set up USB tunneling:
+### 2. Set up USB tunnel
 
 ```bash
 iproxy 8080 8080
 ```
 
-3. In another terminal, run commands:
+### 3. Run commands
 
 ```bash
-# Basic commands
 python3 client.py "ls"
 python3 client.py "pwd"
 python3 client.py "id"
+python3 client.py "uname"
 
-# Download files/directories
+# Download files / directories from sandbox to host
 python3 client.py "scp -r Documents host:./downloads"
+python3 client.py "scp -r Library host:./library"
 ```
 
-The client automatically handles base64 decoding for downloads.
+## Available Commands
 
-### Available Commands
+The DYLIB implements 38 built-in commands — **no `popen()`, no `exec()`** (safe from iOS entitlement restrictions):
 
-- `ls [path]` - List directory contents
-- `pwd` - Print working directory
-- `id` - Print user and group IDs
-- `uname` - Print system information
-- `whoami` - Print current user name
-- `echo <text>` - Echo text back
-- `cp <src> <dst>` - Copy files locally within sandbox
-- `scp -r <src> <dst>` - Download files/directories to host (use `host:./path`)
-
-### Examples
-
-```bash
-# List root directory
-python3 client.py "ls"
-
-# Change directory and list
-python3 client.py "cd Documents"
-python3 client.py "ls"
-
-# Download entire Documents directory
-python3 client.py "scp -r Documents host:./my_downloads"
-
-# Download specific subdirectory
-python3 client.py "scp -r Documents/Subfolder host:./subfolder_download"
-```
+| Command | Description |
+|---------|-------------|
+| `ls [path]` | List directory |
+| `pwd` | Current directory |
+| `cd <path>` | Change directory |
+| `id` | User and group IDs |
+| `whoami` | Current username |
+| `uname` | System information |
+| `echo <text>` | Print text |
+| `cat <file>` | Print file contents |
+| `cp <src> <dst>` | Copy file/directory |
+| `mv <src> <dst>` | Move file/directory |
+| `rm <path>` | Remove file/directory |
+| `mkdir <path>` | Create directory |
+| `stat <path>` | File metadata |
+| `find <path>` | Find files |
+| `env` | Environment variables |
+| `scp -r <src> host:<dst>` | Download to host (base64) |
 
 ## Troubleshooting
 
-### DYLIB Not Loading
-- Check device logs via Xcode Console or `idevicesyslog`
-- Look for "DYLIB loaded successfully" message
-- Ensure signing identity is valid and not expired
-- Try different signing identity
+### `Connection refused` on port 8080
+- Verify the patched app is running on device
+- Check `iproxy 8080 8080` is running
+- Try relaunching the app
 
-### Connection Refused
-- Verify app is running on device
-- Check USB connection: `iproxy 8080 8080` should show "waiting for connection"
-- Ensure port 8080 is not blocked by firewall
+### `omnisette-server` errors during signing
+- Ensure Docker container is running: `docker ps | grep omnisette`
+- Default URL: `http://localhost:6969` (override with `--anisette-url`)
 
-### File Download Issues
-- Check app sandbox permissions
-- Verify destination path exists on host
-- Large files may take time to transfer
+### App rejected on install (`ApplicationVerificationFailed`)
+- Certificate expired — re-run the sign command to get a fresh cert
+- Make sure `--udid` matches the connected device
 
-### Patching Fails
-- Ensure all paths are correct
-- Check that insert_dylib is built and executable
-- Verify IPA is not corrupted
+### `ideviceinstaller not found`
+- macOS: `brew install ideviceinstaller`
+- Linux: `apt install ideviceinstaller`
+- Windows: [libimobiledevice-win32](https://github.com/libimobiledevice-win32/imobiledevice-net)
+
+### Finding Signing Identity (legacy `patch_ipa.sh`)
+
+Only needed if using the old `ios-patch/patch_ipa.sh` script directly:
+
+```bash
+security find-identity -p codesigning -v
+# Look for "Apple Development: ..." identities
+```
 
 ## Security Notes
 
-- This tool is for testing and development purposes only
-- Respect app store policies and legal requirements
-- The injected code runs with app's sandbox permissions
-- Network traffic is tunneled via USB (secure)
-
-## Cross-Platform Patcher (Windows / Linux / macOS)
-
-A Python-based tool that replaces the macOS-only `patch_ipa.sh` script. Works on **any OS** — no Xcode or macOS required.
-
-### Prerequisites
-
-- Python 3.8+
-- Pre-built `libShell.dylib` (compile once on macOS, or download from Releases)
-
-### Installation
-
-```bash
-pip install -r tools/requirements.txt
-```
-
-### Quick Start
-
-```bash
-# Patch an IPA (inject dylib, modify plist)
-python3 tools/patcher.py patch --ipa MyApp.ipa --dylib libShell.dylib
-
-# Option A: Sign with Apple ID (free, cross-platform — like Sideloadly!)
-python3 tools/patcher.py sign --ipa MyApp_patched.ipa --apple-id user@example.com
-
-# Option B: Sign with Apple ID (dedicated command, more options)
-python3 tools/patcher.py sign-apple --ipa MyApp_patched.ipa
-
-# Option C: Skip signing, use Sideloadly instead (for paranoid users)
-python3 tools/patcher.py sign-apple --ipa MyApp_patched.ipa --skip-sign
-
-# Option D: Sign manually with .p12 certificate
-python3 tools/patcher.py sign --ipa MyApp_patched.ipa --p12 cert.p12 -m profile.mobileprovision
-
-# Install on device:
-python3 tools/patcher.py install --ipa MyApp_patched_signed.ipa
-
-# Full pipeline (patch + sign with Apple ID + install):
-python3 tools/patcher.py full --ipa MyApp.ipa --dylib libShell.dylib --apple-id user@example.com --install
-
-# Full pipeline (patch only, skip signing):
-python3 tools/patcher.py full --ipa MyApp.ipa --dylib libShell.dylib --skip-sign
-
-# List connected devices:
-python3 tools/patcher.py devices
-
-# Start USB tunnel:
-python3 tools/patcher.py tunnel
-```
-
-### Apple ID Signing (Built-in, like Sideloadly)
-
-The patcher can sign IPAs using your **free Apple ID** — no paid developer account needed. This works the same way Sideloadly does, directly on **Linux, Windows, and macOS**.
-
-**Prerequisites:**
-- [omnisette-server](https://github.com/SideStore/omnisette-server) running (provides anisette data)
-  ```bash
-  docker run -d --restart always --name omnisette \
-    -p 6969:80 --volume omnisette_data:/opt/omnisette-server/lib \
-    ghcr.io/sidestore/omnisette-server:latest
-  ```
-- Apple ID with 2FA enabled (standard for all accounts)
-
-**Security:**
-- Password is **never stored** to disk — only held in memory
-- Authentication uses Apple's **SRP protocol** (server never sees plaintext password)
-- 2FA is fully supported (trusted device push + SMS)
-- Use `--skip-sign` if you don't trust CLI tools with your credentials
-
-**Free account limitations:**
-- Apps expire in **7 days** (must re-sign weekly)
-- Max **3 app IDs** per week, **10 sideloaded apps** total
-- Limited entitlements
-
-### Recommended Workflow (No macOS needed)
-
-1. Get a pre-built `libShell.dylib` (from Releases or CI)
-2. Run: `python3 tools/patcher.py patch --ipa MyApp.ipa --dylib libShell.dylib`
-3. Open **Sideloadly** (Windows/macOS) → select the patched IPA → install
-4. On device, launch the app
-5. `iproxy 8080 8080` then `python3 client.py "ls"`
-
-### Signing Options
-
-| Method | Platforms | Notes |
-|--------|-----------|-------|
-| **Apple ID** (`--apple-id`) | Win, Linux, macOS | Built-in, like Sideloadly. Free account. Requires omnisette-server |
-| **Sideloadly** | Win, macOS | GUI tool — handles signing + install automatically |
-| **zsign** + `.p12` | Win, Linux, macOS | CLI tool, needs certificate + provisioning profile |
-| **ldid** | Win, Linux, macOS | Fakesign only (jailbreak devices) |
-| **`--skip-sign`** | All | Skip signing — use Sideloadly or other tool later |
-
-## Architecture
-
-- `src/main.m` - DYLIB entry point, initializes server
-- `src/ShellServer.m` - TCP server implementation
-- `src/ShellCommands.m` - Command execution logic (38 built-in commands)
-- `ios-patch/patch_ipa.sh` - IPA patching script (macOS only)
-- `tools/patcher.py` - Cross-platform IPA patcher (Windows/Linux/macOS)
-- `tools/apple_account.py` - Apple ID authentication & signing module
-- `client.py` - Python client for remote commands
+- For testing and research purposes only
+- Injected code runs entirely within the app's sandbox
+- Network traffic is tunnelled over USB (never exposed to the network)
+- Apple ID password is never written to disk; authentication uses SRP

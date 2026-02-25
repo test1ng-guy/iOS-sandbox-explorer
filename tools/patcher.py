@@ -189,7 +189,7 @@ class MachOInjector:
         #   cmd (4) + cmdsize (4) + name_offset (4) + timestamp (4) +
         #   current_version (4) + compat_version (4) + name string
         name_offset_val = 24  # offset to name from start of command
-        cmd_body = struct.pack('<II', DYLIB_LOAD_COMMAND, 0)  # cmd, cmdsize (placeholder)
+        cmd_body = bytearray(struct.pack('<II', DYLIB_LOAD_COMMAND, 0))  # cmd, cmdsize (placeholder)
         cmd_body += struct.pack('<I', name_offset_val)  # name offset
         cmd_body += struct.pack('<I', 2)  # timestamp
         cmd_body += struct.pack('<I', 0x00010000)  # current_version (1.0.0)

@@ -49,6 +49,17 @@ server_log.txt
 *.cer
 embedded.mobileprovision
 
+# Debug / test scripts (local only)
+debug_auth.py
+test_portal.py
+frida_test.js
+
+# Local downloads from device
+Downloads/
+
+# Python virtualenv
+.venv/
+
 # Sensitive data
 .env
 secrets.json
