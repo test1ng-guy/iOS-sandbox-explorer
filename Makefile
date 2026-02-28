@@ -1,7 +1,7 @@
 # Makefile for building DYLIB on macOS/iOS
 
 CC = clang
-CFLAGS = -fobjc-arc -framework Foundation -dynamiclib -arch arm64 -isysroot $(shell xcrun --sdk iphoneos --show-sdk-path) -Iinclude
+CFLAGS = -fobjc-arc -framework Foundation -framework Security -dynamiclib -arch arm64 -isysroot $(shell xcrun --sdk iphoneos --show-sdk-path) -Iinclude
 LDFLAGS = -dynamiclib
 
 TARGET = libShell.dylib

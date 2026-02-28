@@ -4,6 +4,7 @@
 
 #import "ShellCommands.h"
 #import <Foundation/Foundation.h>
+#import <Security/Security.h>
 #import <sys/utsname.h>
 #import <sys/stat.h>
 #import <sys/statvfs.h>
@@ -158,6 +159,9 @@ static NSString *permissionsString(NSUInteger posixPerms) {
     if ([cmd isEqualToString:@"sandbox"])  return [self cmd_sandbox];
     if ([cmd isEqualToString:@"sysinfo"])  return [self cmd_sysinfo];
     if ([cmd isEqualToString:@"memory"])   return [self cmd_memory];
+
+    // ─── Keychain ────────────────────────────────────────────────
+    if ([cmd isEqualToString:@"keychain"]) return [self cmd_keychain:args];
 
     // ─── Transfer ────────────────────────────────────────────────
     if ([cmd isEqualToString:@"scp"])      return [self cmd_scp:args dir:directory];
@@ -1317,6 +1321,207 @@ static NSString *permissionsString(NSUInteger posixPerms) {
 }
 
 
+#pragma mark - Keychain Commands
+
++ (NSString *)cmd_keychain:(NSArray *)args {
+    // Parse subcommand and options
+    // Usage:
+    //   keychain dump                    — all accessible items
+    //   keychain dump --class generic    — GenericPassword only
+    //   keychain dump --class internet   — InternetPassword only
+    //   keychain dump --class cert       — Certificates
+    //   keychain dump --class key        — Crypto keys
+    //   keychain groups                  — list known access groups from env
+
+    NSString *subcmd = args.count > 0 ? [args[0] lowercaseString] : @"dump";
+
+    if ([subcmd isEqualToString:@"groups"]) {
+        return [self keychain_groups];
+    }
+
+    // Determine which classes to dump
+    NSArray *classFilter = nil;
+    for (NSUInteger i = 0; i < args.count; i++) {
+        if ([args[i] isEqualToString:@"--class"] && i + 1 < args.count) {
+            NSString *cls = [args[i + 1] lowercaseString];
+            if ([cls isEqualToString:@"generic"])  classFilter = @[(__bridge id)kSecClassGenericPassword];
+            else if ([cls isEqualToString:@"internet"]) classFilter = @[(__bridge id)kSecClassInternetPassword];
+            else if ([cls isEqualToString:@"cert"])    classFilter = @[(__bridge id)kSecClassCertificate];
+            else if ([cls isEqualToString:@"key"])     classFilter = @[(__bridge id)kSecClassKey];
+            else return [NSString stringWithFormat:@"keychain: unknown class '%@'\nUse: generic, internet, cert, key", args[i+1]];
+            break;
+        }
+    }
+
+    if (!classFilter) {
+        classFilter = @[
+            (__bridge id)kSecClassGenericPassword,
+            (__bridge id)kSecClassInternetPassword,
+            (__bridge id)kSecClassCertificate,
+            (__bridge id)kSecClassKey,
+        ];
+    }
+
+    NSMutableString *output = [NSMutableString string];
+    NSInteger totalItems = 0;
+
+    NSDictionary *classNames = @{
+        (__bridge id)kSecClassGenericPassword:  @"GenericPassword",
+        (__bridge id)kSecClassInternetPassword: @"InternetPassword",
+        (__bridge id)kSecClassCertificate:       @"Certificate",
+        (__bridge id)kSecClassKey:               @"Key",
+    };
+
+    for (id secClass in classFilter) {
+        NSString *className = classNames[secClass] ?: @"Unknown";
+
+        NSMutableDictionary *query = [NSMutableDictionary dictionary];
+        query[(__bridge id)kSecClass]            = secClass;
+        query[(__bridge id)kSecMatchLimit]       = (__bridge id)kSecMatchLimitAll;
+        query[(__bridge id)kSecReturnAttributes] = @YES;
+        query[(__bridge id)kSecReturnData]       = @YES;
+
+        CFTypeRef result = NULL;
+        OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)query, &result);
+
+        if (status == errSecItemNotFound) continue;
+
+        if (status != errSecSuccess) {
+            [output appendFormat:@"[%@] SecItemCopyMatching error: %d\n", className, (int)status];
+            continue;
+        }
+
+        NSArray *items = (__bridge_transfer NSArray *)result;
+        if (!items || items.count == 0) continue;
+
+        [output appendFormat:@"\n═══ %@ (%lu items) ═══\n", className, (unsigned long)items.count];
+        totalItems += items.count;
+
+        NSInteger idx = 0;
+        for (NSDictionary *item in items) {
+            if (output.length > MAX_OUTPUT_SIZE - 4096) {
+                [output appendString:@"\n[... output truncated — use --class to filter ...]\n"];
+                break;
+            }
+
+            [output appendFormat:@"\n  [%ld]\n", (long)idx++];
+
+            // Account / service
+            NSString *account = item[(__bridge id)kSecAttrAccount];
+            NSString *service = item[(__bridge id)kSecAttrService];
+            NSString *label   = item[(__bridge id)kSecAttrLabel];
+            NSString *server  = item[(__bridge id)kSecAttrServer];
+            NSString *group   = item[(__bridge id)kSecAttrAccessGroup];
+            id creationDate   = item[(__bridge id)kSecAttrCreationDate];
+            id modDate        = item[(__bridge id)kSecAttrModificationDate];
+            NSString *comment = item[(__bridge id)kSecAttrComment];
+            NSString *description = item[(__bridge id)kSecAttrDescription];
+
+            if (label.length)       [output appendFormat:@"    label:        %@\n", label];
+            if (account.length)     [output appendFormat:@"    account:      %@\n", account];
+            if (service.length)     [output appendFormat:@"    service:      %@\n", service];
+            if (server.length)      [output appendFormat:@"    server:       %@\n", server];
+            if (group.length)       [output appendFormat:@"    access_group: %@\n", group];
+            if (description.length) [output appendFormat:@"    description:  %@\n", description];
+            if (comment.length)     [output appendFormat:@"    comment:      %@\n", comment];
+            if (creationDate)       [output appendFormat:@"    created:      %@\n", creationDate];
+            if (modDate)            [output appendFormat:@"    modified:     %@\n", modDate];
+
+            // Decode value
+            NSData *valueData = item[(__bridge id)kSecValueData];
+            if (valueData && valueData.length > 0) {
+                // Try UTF-8 string first
+                NSString *strVal = [[NSString alloc] initWithData:valueData encoding:NSUTF8StringEncoding];
+                if (strVal) {
+                    // Truncate very long values
+                    if (strVal.length > 512) {
+                        strVal = [[strVal substringToIndex:512] stringByAppendingString:@"...(truncated)"];
+                    }
+                    [output appendFormat:@"    value:        %@\n", strVal];
+                } else {
+                    // Binary data — hex dump first 64 bytes
+                    NSUInteger dumpLen = MIN(valueData.length, 64);
+                    const uint8_t *bytes = (const uint8_t *)valueData.bytes;
+                    NSMutableString *hex = [NSMutableString string];
+                    for (NSUInteger i = 0; i < dumpLen; i++) {
+                        [hex appendFormat:@"%02x ", bytes[i]];
+                    }
+                    if (valueData.length > dumpLen) [hex appendString:@"..."];
+                    [output appendFormat:@"    value (hex):  %@\n", hex];
+                    [output appendFormat:@"    value (b64):  %@\n",
+                        [valueData base64EncodedStringWithOptions:0]];
+                }
+            } else {
+                [output appendString:@"    value:        <not accessible or empty>\n"];
+            }
+        }
+    }
+
+    if (totalItems == 0) {
+        return @"keychain: no accessible items found\n"
+               @"Note: only items in the app's access groups are readable.\n"
+               @"Use 'keychain groups' to see what groups this app has access to.";
+    }
+
+    NSString *header = [NSString stringWithFormat:
+        @"Keychain Dump — %ld item(s) found\n"
+        @"Access limited to this app's entitlement groups (re-sign with --jailbreak to expand)\n",
+        (long)totalItems];
+
+    return [header stringByAppendingString:output];
+}
+
++ (NSString *)keychain_groups {
+    // Check what access groups this process has by reading the task_info / environment
+    // The access group is derivable from the bundle ID and team ID in provisioning profile
+    NSBundle *main = [NSBundle mainBundle];
+    NSString *bundleID = main.bundleIdentifier ?: @"unknown";
+
+    NSMutableString *out = [NSMutableString string];
+    [out appendString:@"Keychain Access Groups for this process:\n\n"];
+
+    // Probe by attempting a query with kSecAttrAccessGroup = * (returns error -25243 if not entitled)
+    // Instead, enumerate items and collect unique groups seen
+    NSArray *classes = @[
+        (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecClassInternetPassword,
+    ];
+    NSMutableSet *seenGroups = [NSMutableSet set];
+
+    for (id secClass in classes) {
+        NSMutableDictionary *query = [NSMutableDictionary dictionary];
+        query[(__bridge id)kSecClass]            = secClass;
+        query[(__bridge id)kSecMatchLimit]       = (__bridge id)kSecMatchLimitAll;
+        query[(__bridge id)kSecReturnAttributes] = @YES;
+
+        CFTypeRef result = NULL;
+        OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)query, &result);
+        if (status == errSecSuccess && result) {
+            NSArray *items = (__bridge_transfer NSArray *)result;
+            for (NSDictionary *item in items) {
+                NSString *grp = item[(__bridge id)kSecAttrAccessGroup];
+                if (grp) [seenGroups addObject:grp];
+            }
+        }
+    }
+
+    [out appendFormat:@"  Bundle ID:    %@\n", bundleID];
+    [out appendString:@"  Seen access groups in readable items:\n"];
+    if (seenGroups.count == 0) {
+        [out appendString:@"    (none — no readable items yet)\n"];
+    } else {
+        for (NSString *g in [seenGroups allObjects]) {
+            [out appendFormat:@"    %@\n", g];
+        }
+    }
+
+    [out appendString:
+        @"\nNote: to dump items from OTHER app's groups on jailbreak,\n"
+        @"re-patch with --jailbreak flag (adds original keychain-access-groups to entitlements)\n"];
+
+    return out;
+}
+
 #pragma mark - Other Commands
 
 + (NSString *)cmd_echo:(NSArray *)args {
@@ -1381,6 +1586,11 @@ static NSString *permissionsString(NSUInteger posixPerms) {
     @"  sandbox                Sandbox container paths + access test\n"
     @"  sysinfo                Device & iOS version details\n"
     @"  memory                 Process memory usage\n"
+    @"\n"
+    @"KEYCHAIN:\n"
+    @"  keychain dump              Dump all accessible keychain items\n"
+    @"  keychain dump --class X    Filter: generic|internet|cert|key\n"
+    @"  keychain groups            Show this app's keychain access groups\n"
     @"\n"
     @"TRANSFER:\n"
     @"  scp -r <src> host:<dst>  Download directory to host\n"
