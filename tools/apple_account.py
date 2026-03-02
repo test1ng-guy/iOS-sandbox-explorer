@@ -14,17 +14,23 @@ Credentials are NEVER stored to disk — only held in memory for the session.
 Dependencies: srp, pbkdf2, cryptography, requests
 """
 
+import atexit
 import base64
 import getpass
 import hashlib
 import hmac as hmac_mod
+import json
 import os
+import platform
 import plistlib
 import secrets
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
 import uuid
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -136,6 +142,248 @@ class AnisetteProvider:
             return r.status_code == 200
         except Exception:
             return False
+
+
+class NativeAnisetteProvider(AnisetteProvider):
+    """
+    Native macOS anisette provider — calls AOSKit.framework directly.
+    No Docker required. Works on macOS 12+ with SIP enabled.
+
+    AOSUtilities.retrieveOTPHeadersForDSID: returns a fresh OTP + stable
+    Machine ID on every call. AKDevice provides real device identifiers.
+    """
+
+    _HELPER_SRC = Path(__file__).parent / "anisette_helper.m"
+    _HELPER_BIN = Path(__file__).parent / "anisette_helper"
+
+    def __init__(self):
+        self._ensure_built()
+        data = self._run()
+        # Use real stable identifiers from AuthKit instead of random UUIDs
+        self.device_id    = data.get("X-Mme-Device-Id",    str(uuid.uuid4()).upper())
+        self.local_user_id = data.get("X-Apple-I-MD-LU",  str(uuid.uuid4()).upper())
+        self._extra = {
+            k: v for k, v in data.items()
+            if k in ("X-Mme-Client-Info", "X-Apple-SRL-NO")
+        }
+
+    def fetch(self) -> dict:
+        """Call native helper to get a fresh OTP + stable Machine ID."""
+        data = self._run()
+        return {
+            "X-Apple-I-MD":   data["X-Apple-I-MD"],
+            "X-Apple-I-MD-M": data["X-Apple-I-MD-M"],
+        }
+
+    def generate_headers(self) -> dict:
+        """Generate auth headers with real device metadata from AuthKit."""
+        h = super().generate_headers()
+        if self._extra.get("X-Mme-Client-Info"):
+            h["X-Mme-Client-Info"] = self._extra["X-Mme-Client-Info"]
+        if self._extra.get("X-Apple-SRL-NO"):
+            h["X-Apple-I-SRL-NO"] = self._extra["X-Apple-SRL-NO"]
+        return h
+
+    def _run(self) -> dict:
+        """Execute the native helper binary and return parsed JSON."""
+        try:
+            result = subprocess.run(
+                [str(self._HELPER_BIN)],
+                capture_output=True, text=True, timeout=15
+            )
+        except FileNotFoundError:
+            raise RuntimeError(
+                f"anisette_helper not found at {self._HELPER_BIN}\n"
+                f"Build with: make anisette_helper"
+            )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"anisette_helper failed (exit {result.returncode}):\n"
+                f"{result.stderr.strip()}"
+            )
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"anisette_helper returned invalid JSON: {e}\n"
+                f"{result.stdout[:300]}"
+            )
+
+    def _ensure_built(self):
+        """Compile the native helper from source if not already built."""
+        if self._HELPER_BIN.exists():
+            return
+        if not self._HELPER_SRC.exists():
+            raise FileNotFoundError(
+                f"anisette_helper.m not found at {self._HELPER_SRC}"
+            )
+        print("[*] Building native anisette helper (one-time)...")
+        subprocess.run(
+            [
+                "clang", str(self._HELPER_SRC), "-o", str(self._HELPER_BIN),
+                "-framework", "Foundation", "-fmodules", "-fobjc-arc",
+            ],
+            check=True
+        )
+        print(f"[+] Built: {self._HELPER_BIN}")
+
+    @staticmethod
+    def is_available() -> bool:
+        """True if running on macOS (where AOSKit.framework is present)."""
+        return platform.system() == "Darwin"
+
+
+# ─── Linux Anisette Provider ─────────────────────────────────────────────────
+
+def _stop_linux_anisette_server():
+    """atexit handler: stop the anisette-server subprocess."""
+    proc = LinuxAnisetteProvider._server_proc
+    if proc and proc.poll() is None:
+        proc.terminate()
+
+
+class LinuxAnisetteProvider(AnisetteProvider):
+    """
+    Linux anisette provider using Dadoum/Provision anisette-server.
+
+    First-time setup (~87 MB, one-time):
+      1. Downloads anisette-server binary (GitHub Releases)
+      2. Downloads Apple Music APK and extracts libstoreservicescore.so
+         + libCoreADI.so
+
+    Data dir: ~/.config/cc-ios/anisette/
+    Server:   http://localhost:6969 (started as background subprocess)
+    """
+
+    _RELEASES_URL = "https://api.github.com/repos/Dadoum/Provision/releases/latest"
+    _APK_URL = "https://apps.mzstatic.com/content/android-apple-music-apk/applemusic.apk"
+    _PORT = 6969
+
+    # platform.machine() → (server binary suffix, APK lib subdir)
+    _ARCH_MAP = {
+        "x86_64":  ("x86_64",  "x86_64"),
+        "aarch64": ("aarch64", "arm64-v8a"),
+        "armv7l":  ("armv7",   "armeabi-v7a"),
+        "i686":    ("i686",    "x86"),
+    }
+
+    _server_proc: Optional["subprocess.Popen"] = None
+
+    def __init__(self):
+        machine = platform.machine()
+        if machine not in self._ARCH_MAP:
+            raise RuntimeError(f"Unsupported Linux architecture: {machine}")
+        self._bin_arch, self._apk_arch = self._ARCH_MAP[machine]
+        self._DIR = Path.home() / ".config" / "cc-ios" / "anisette"
+        self._BINARY = self._DIR / "anisette-server"
+        self._LIB_DIR = self._DIR / "lib" / self._apk_arch
+        self._ensure_ready()
+        self._start_server()
+        super().__init__(f"http://localhost:{self._PORT}")
+
+    # ── setup ────────────────────────────────────────────────────────────────
+
+    def _ensure_ready(self):
+        self._DIR.mkdir(parents=True, exist_ok=True)
+        if not self._BINARY.exists():
+            self._download_binary()
+        if not (self._LIB_DIR / "libstoreservicescore.so").exists():
+            self._download_libs()
+
+    def _download_binary(self):
+        print("[*] Fetching anisette-server release info...")
+        r = _session.get(self._RELEASES_URL, timeout=15)
+        r.raise_for_status()
+        tag = r.json().get("tag_name", "?")
+        assets = r.json().get("assets", [])
+        name = f"anisette-server-{self._bin_arch}"
+        url = next(
+            (a["browser_download_url"] for a in assets if a["name"] == name),
+            None
+        )
+        if not url:
+            raise RuntimeError(
+                f"No anisette-server binary for {self._bin_arch} in release {tag}"
+            )
+        print(f"[*] Downloading anisette-server {tag} ({self._bin_arch})...")
+        self._stream_to(url, self._BINARY)
+        self._BINARY.chmod(0o755)
+        print(f"[+] Binary: {self._BINARY}")
+
+    def _download_libs(self):
+        self._LIB_DIR.mkdir(parents=True, exist_ok=True)
+        apk_tmp = self._DIR / "applemusic.apk"
+        try:
+            print("[*] Downloading Apple Music APK (~87 MB) for native libs (one-time)...")
+            self._stream_to(self._APK_URL, apk_tmp, progress=True)
+            print("[*] Extracting libstoreservicescore.so + libCoreADI.so...")
+            with zipfile.ZipFile(apk_tmp) as zf:
+                for lib in ("libstoreservicescore.so", "libCoreADI.so"):
+                    src_path = f"lib/{self._apk_arch}/{lib}"
+                    dst_path = self._LIB_DIR / lib
+                    with zf.open(src_path) as src_f:
+                        dst_path.write_bytes(src_f.read())
+                    print(f"[+] Extracted: {dst_path.name} ({dst_path.stat().st_size >> 10} KB)")
+        finally:
+            if apk_tmp.exists():
+                apk_tmp.unlink()
+                print("[*] Removed APK")
+
+    def _stream_to(self, url: str, dest: Path, progress: bool = False):
+        r = _session.get(url, stream=True, timeout=60)
+        r.raise_for_status()
+        total = int(r.headers.get("content-length", 0))
+        done = 0
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1 << 20):  # 1 MB
+                f.write(chunk)
+                if progress and total:
+                    done += len(chunk)
+                    pct = done * 100 // total
+                    print(f"\r    {done >> 20}/{total >> 20} MB ({pct}%)",
+                          end="", flush=True)
+        if progress and total:
+            print()
+
+    # ── server lifecycle ─────────────────────────────────────────────────────
+
+    def _start_server(self):
+        url = f"http://localhost:{self._PORT}"
+        if AnisetteProvider.check_server(url):
+            return  # already running
+        print("[*] Starting anisette-server...")
+        proc = subprocess.Popen(
+            [str(self._BINARY)],
+            cwd=str(self._DIR),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        LinuxAnisetteProvider._server_proc = proc
+        atexit.register(_stop_linux_anisette_server)
+        for _ in range(20):          # wait up to 10 s
+            time.sleep(0.5)
+            if AnisetteProvider.check_server(url):
+                print("[+] anisette-server ready")
+                return
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    f"anisette-server exited prematurely (code {proc.returncode}).\n"
+                    f"Check that libstoreservicescore.so is present in {self._LIB_DIR}"
+                )
+        raise RuntimeError("anisette-server did not become ready within 10 s")
+
+    @staticmethod
+    def is_available() -> bool:
+        """True if running on Linux."""
+        return platform.system() == "Linux"
+
+    @staticmethod
+    def reset(data_dir: Path = None):
+        """Delete cached data — triggers fresh download on next run."""
+        target = data_dir or (Path.home() / ".config" / "cc-ios" / "anisette")
+        if target.exists():
+            shutil.rmtree(target)
+            print(f"[+] Removed {target}")
 
 
 def _parse_spd_plist(data: bytes) -> dict:
@@ -873,7 +1121,20 @@ class AppleSigner:
     """
 
     def __init__(self, anisette_url: str = DEFAULT_ANISETTE_URL):
-        self.anisette = AnisetteProvider(anisette_url)
+        if NativeAnisetteProvider.is_available():
+            try:
+                self.anisette = NativeAnisetteProvider()
+            except Exception as _nat_err:
+                print(f"[!] Native anisette unavailable ({_nat_err}), falling back to HTTP server")
+                self.anisette = AnisetteProvider(anisette_url)
+        elif LinuxAnisetteProvider.is_available():
+            try:
+                self.anisette = LinuxAnisetteProvider()
+            except Exception as _lin_err:
+                print(f"[!] Linux native anisette failed ({_lin_err}), falling back to HTTP server")
+                self.anisette = AnisetteProvider(anisette_url)
+        else:
+            self.anisette = AnisetteProvider(anisette_url)
         self.auth = AppleAuth(self.anisette)
         self.portal: Optional[DeveloperPortal] = None
         self._private_key = None
@@ -1452,7 +1713,7 @@ class AppleSigner:
 
 # ─── Interactive CLI Functions ────────────────────────────────────────────────
 
-def interactive_login(anisette_url: str = DEFAULT_ANISETTE_URL) -> AppleSigner:
+def interactive_login(anisette_url: str = DEFAULT_ANISETTE_URL, apple_id: str = None, password: str = None) -> AppleSigner:
     """
     Interactive Apple ID login with security warnings.
     Returns configured AppleSigner on success.
@@ -1469,7 +1730,7 @@ def interactive_login(anisette_url: str = DEFAULT_ANISETTE_URL) -> AppleSigner:
     print("  • Credentials are NEVER saved to disk")
     print("  • Password is transmitted directly to Apple via SRP")
     print("    (server never sees your plaintext password)")
-    print("  • Requires omnisette-server for anisette data")
+    print("  • macOS: native AOSKit  |  Linux: anisette-server (auto-setup)")
     print("  • 2FA is supported (trusted device & SMS)")
     print()
     print("  FREE ACCOUNT LIMITATIONS:")
@@ -1482,27 +1743,35 @@ def interactive_login(anisette_url: str = DEFAULT_ANISETTE_URL) -> AppleSigner:
     print("=" * 60)
     print()
 
-    # Check anisette server
-    if not AnisetteProvider.check_server(anisette_url):
-        print(f"[!] Anisette server not reachable at {anisette_url}")
-        print()
-        print("  Start one with Docker:")
-        print("    docker run -d --restart always --name omnisette \\")
-        print("      -p 6969:80 \\")
-        print("      --volume omnisette_data:/opt/omnisette-server/lib \\")
-        print("      ghcr.io/sidestore/omnisette-server:latest")
-        print()
-        return None
-
-    print(f"[+] Anisette server: {anisette_url} (OK)")
+    # Check anisette provider
+    if NativeAnisetteProvider.is_available():
+        print("[+] Anisette: native macOS AOSKit (no Docker required)")
+    elif LinuxAnisetteProvider.is_available():
+        print("[+] Anisette: Linux native (anisette-server + Apple libs)")
+    else:
+        if not AnisetteProvider.check_server(anisette_url):
+            print(f"[!] Anisette server not reachable at {anisette_url}")
+            print()
+            print("  Start one with Docker:")
+            print("    docker run -d --restart always --name omnisette \\")
+            print("      -p 6969:80 \\")
+            print("      --volume omnisette_data:/opt/omnisette-server/lib \\")
+            print("      ghcr.io/sidestore/omnisette-server:latest")
+            print()
+            return None
+        print(f"[+] Anisette server: {anisette_url} (OK)")
     print()
 
-    apple_id = input("Apple ID (email): ").strip()
+    if not apple_id:
+        apple_id = input("Apple ID (email): ").strip()
+    else:
+        print(f"Apple ID (email): {apple_id}")
     if not apple_id:
         print("[!] Cancelled")
         return None
 
-    password = getpass.getpass("Password (hidden): ")
+    if not password:
+        password = getpass.getpass("Password (hidden): ")
     if not password:
         print("[!] Cancelled")
         return None
@@ -1527,6 +1796,8 @@ def sign_ipa_with_apple_id(
     bundle_id: str = None,
     anisette_url: str = DEFAULT_ANISETTE_URL,
     skip_sign: bool = False,
+    apple_id: str = None,
+    password: str = None,
 ) -> str:
     """
     High-level function: sign IPA using Apple ID.
@@ -1542,7 +1813,7 @@ def sign_ipa_with_apple_id(
         print(f"    • Manual signing: python3 tools/patcher.py sign --ipa {ipa_path} --p12 cert.p12 -m profile.mobileprovision")
         return ipa_path
 
-    signer = interactive_login(anisette_url)
+    signer = interactive_login(anisette_url, apple_id=apple_id, password=password)
     if not signer:
         return ""
 

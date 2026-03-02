@@ -1326,12 +1326,14 @@ static NSString *permissionsString(NSUInteger posixPerms) {
 + (NSString *)cmd_keychain:(NSArray *)args {
     // Parse subcommand and options
     // Usage:
-    //   keychain dump                    — all accessible items
-    //   keychain dump --class generic    — GenericPassword only
-    //   keychain dump --class internet   — InternetPassword only
-    //   keychain dump --class cert       — Certificates
-    //   keychain dump --class key        — Crypto keys
-    //   keychain groups                  — list known access groups from env
+    //   keychain dump                        — all accessible items
+    //   keychain dump --class generic        — GenericPassword only
+    //   keychain dump --class internet       — InternetPassword only
+    //   keychain dump --class cert           — Certificates
+    //   keychain dump --class key            — Crypto keys
+    //   keychain dump --filter <str>         — only items where any field contains <str>
+    //   keychain dump --filter self          — only items matching current app's bundle ID
+    //   keychain groups                      — list known access groups from env
 
     NSString *subcmd = args.count > 0 ? [args[0] lowercaseString] : @"dump";
 
@@ -1341,6 +1343,8 @@ static NSString *permissionsString(NSUInteger posixPerms) {
 
     // Determine which classes to dump
     NSArray *classFilter = nil;
+    NSString *textFilter = nil;  // --filter value
+
     for (NSUInteger i = 0; i < args.count; i++) {
         if ([args[i] isEqualToString:@"--class"] && i + 1 < args.count) {
             NSString *cls = [args[i + 1] lowercaseString];
@@ -1349,7 +1353,13 @@ static NSString *permissionsString(NSUInteger posixPerms) {
             else if ([cls isEqualToString:@"cert"])    classFilter = @[(__bridge id)kSecClassCertificate];
             else if ([cls isEqualToString:@"key"])     classFilter = @[(__bridge id)kSecClassKey];
             else return [NSString stringWithFormat:@"keychain: unknown class '%@'\nUse: generic, internet, cert, key", args[i+1]];
-            break;
+        } else if ([args[i] isEqualToString:@"--filter"] && i + 1 < args.count) {
+            NSString *f = args[i + 1];
+            if ([f isEqualToString:@"self"]) {
+                textFilter = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+            } else {
+                textFilter = f;
+            }
         }
     }
 
@@ -1393,6 +1403,32 @@ static NSString *permissionsString(NSUInteger posixPerms) {
 
         NSArray *items = (__bridge_transfer NSArray *)result;
         if (!items || items.count == 0) continue;
+
+        // Apply --filter: keep only items where any string field contains the filter string
+        if (textFilter.length > 0) {
+            NSMutableArray *filtered = [NSMutableArray array];
+            NSString *lf = [textFilter lowercaseString];
+            for (NSDictionary *item in items) {
+                NSArray *fields = @[
+                    item[(__bridge id)kSecAttrAccount]     ?: @"",
+                    item[(__bridge id)kSecAttrService]     ?: @"",
+                    item[(__bridge id)kSecAttrLabel]       ?: @"",
+                    item[(__bridge id)kSecAttrServer]      ?: @"",
+                    item[(__bridge id)kSecAttrAccessGroup] ?: @"",
+                    item[(__bridge id)kSecAttrComment]     ?: @"",
+                    item[(__bridge id)kSecAttrDescription] ?: @"",
+                ];
+                for (NSString *f in fields) {
+                    if ([[f lowercaseString] containsString:lf]) {
+                        [filtered addObject:item];
+                        break;
+                    }
+                }
+            }
+            items = filtered;
+        }
+
+        if (items.count == 0) continue;
 
         [output appendFormat:@"\n═══ %@ (%lu items) ═══\n", className, (unsigned long)items.count];
         totalItems += items.count;
@@ -1458,15 +1494,24 @@ static NSString *permissionsString(NSUInteger posixPerms) {
     }
 
     if (totalItems == 0) {
+        if (textFilter.length > 0) {
+            return [NSString stringWithFormat:
+                @"keychain: no items matching filter '%@'\n"
+                @"Try: keychain dump  (without --filter) to see all items", textFilter];
+        }
         return @"keychain: no accessible items found\n"
                @"Note: only items in the app's access groups are readable.\n"
                @"Use 'keychain groups' to see what groups this app has access to.";
     }
 
+    NSString *filterNote = textFilter.length > 0
+        ? [NSString stringWithFormat:@"Filter: '%@'\n", textFilter]
+        : @"";
+
     NSString *header = [NSString stringWithFormat:
-        @"Keychain Dump — %ld item(s) found\n"
+        @"Keychain Dump — %ld item(s) found\n%@"
         @"Access limited to this app's entitlement groups (re-sign with --jailbreak to expand)\n",
-        (long)totalItems];
+        (long)totalItems, filterNote];
 
     return [header stringByAppendingString:output];
 }
@@ -1588,9 +1633,11 @@ static NSString *permissionsString(NSUInteger posixPerms) {
     @"  memory                 Process memory usage\n"
     @"\n"
     @"KEYCHAIN:\n"
-    @"  keychain dump              Dump all accessible keychain items\n"
-    @"  keychain dump --class X    Filter: generic|internet|cert|key\n"
-    @"  keychain groups            Show this app's keychain access groups\n"
+    @"  keychain dump                    Dump all accessible keychain items\n"
+    @"  keychain dump --class X          Filter: generic|internet|cert|key\n"
+    @"  keychain dump --filter <str>     Keep items where any field contains <str>\n"
+    @"  keychain dump --filter self      Filter by current app's bundle ID\n"
+    @"  keychain groups                  Show this app's keychain access groups\n"
     @"\n"
     @"TRANSFER:\n"
     @"  scp -r <src> host:<dst>  Download directory to host\n"

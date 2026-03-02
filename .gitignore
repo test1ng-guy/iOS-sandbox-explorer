@@ -102,4 +102,4 @@ yarn-error.log*
 
 # Temporary directories
 temp/
-tmp/
+tmp/tools/anisette_helper

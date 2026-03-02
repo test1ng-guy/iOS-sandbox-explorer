@@ -20,6 +20,7 @@ import os
 import plistlib
 import shutil
 import struct
+import subprocess
 import sys
 import tempfile
 import zipfile
@@ -471,30 +472,26 @@ class DeviceManager:
             print(f"  [{i}] UDID: {dev.serial}")
 
     @staticmethod
-    def install_ipa(ipa_path: str):
-        """Install IPA onto connected iOS device."""
-        if not DeviceManager._check_pymobiledevice3():
-            return False
+    def install_ipa(ipa_path: str, udid: str = None):
+        """Install IPA onto connected iOS device via ideviceinstaller."""
+        if shutil.which('ideviceinstaller'):
+            cmd = ['ideviceinstaller']
+            if udid:
+                cmd += ['-u', udid]
+            cmd += ['install', ipa_path]
+            print(f"[*] Installing on device{': ' + udid[:12] + '...' if udid else ''}")
+            result = subprocess.run(cmd, text=True)
+            if result.returncode == 0:
+                print("[+] Installation complete!")
+                return True
+            else:
+                print(f"[!] ideviceinstaller failed (exit {result.returncode})")
+                return False
 
-        from pymobiledevice3.usbmux import select_devices_by_connection_type
-        from pymobiledevice3.lockdown import LockdownClient
-        from pymobiledevice3.services.installation_proxy import InstallationProxyService
-
-        devices = select_devices_by_connection_type(connection_type='USB')
-        if not devices:
-            print("[!] No USB-connected iOS devices found.")
-            return False
-
-        device = devices[0]
-        print(f"[*] Installing on device: {device.serial}")
-
-        lockdown = LockdownClient(device)
-        service = InstallationProxyService(lockdown=lockdown)
-
-        print(f"[*] Installing {ipa_path}...")
-        service.install_from_local(ipa_path)
-        print("[+] Installation complete!")
-        return True
+        print("[!] ideviceinstaller not found.")
+        print("    macOS:  brew install ideviceinstaller")
+        print("    Linux:  apt install ideviceinstaller")
+        return False
 
     @staticmethod
     def start_tunnel(local_port: int = 8080, remote_port: int = 8080):
@@ -579,6 +576,7 @@ def cmd_sign(args):
             output_path=output,
             udid=udid,
             anisette_url=anisette_url,
+            apple_id=apple_id,
         )
         return
 
@@ -700,6 +698,7 @@ def cmd_full(args):
                 output_path=signed_output,
                 udid=udid,
                 anisette_url=anisette_url,
+                apple_id=apple_id,
             )
             if result:
                 output = signed_output
@@ -718,7 +717,8 @@ def cmd_full(args):
 
         # Install if requested
         if getattr(args, 'install', False):
-            DeviceManager.install_ipa(output)
+            udid = getattr(args, 'udid', None)
+            DeviceManager.install_ipa(output, udid=udid)
 
         print()
         print("=" * 60)
