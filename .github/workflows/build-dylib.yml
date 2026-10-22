@@ -1,0 +1,121 @@
+# Build libShell.dylib on macOS; upload workflow artifact.
+# GitHub Releases only for semver tag pushes (v*.*.*) whose commit is on main.
+# Untagged pushes to main / PRs build + artifact only — never tag or Release.
+
+name: Build libShell.dylib
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - "v*.*.*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build arm64 iphoneos dylib
+    # iOS 27 SDK lives on the dedicated Xcode 27 image (GA 2026-10-15).
+    # macos-latest / macos-26 tops out at iOS 26.x — do not pretend otherwise.
+    runs-on: xcode-27
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode / SDK and require iOS 27+
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          SDK_VER="$(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "iphoneos SDK version: ${SDK_VER}"
+          SDK_MAJOR="${SDK_VER%%.*}"
+          if [ -z "${SDK_MAJOR}" ] || [ "${SDK_MAJOR}" -lt 27 ]; then
+            echo "[!] HALT: need iphoneos SDK major >= 27 (got '${SDK_VER}')."
+            echo "    Runner must provide a real iOS 27 SDK — do not fake version numbers."
+            exit 1
+          fi
+          echo "[+] iphoneos SDK major ${SDK_MAJOR} >= 27"
+
+      - name: Build libShell.dylib
+        run: make clean && make
+        env:
+          IPHONEOS_DEPLOYMENT_TARGET: "14.0"
+          REQUIRE_IOS_SDK_MAJOR: "1"
+          IPHONEOS_SDK_MIN_MAJOR: "27"
+
+      - name: Verify Mach-O min OS 14.0 and SDK 27+
+        run: |
+          set -euo pipefail
+          file libShell.dylib
+          echo "--- version load commands ---"
+          otool -l libShell.dylib | grep -A6 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_IPHONEOS'
+          # Deployment target stays 14.0 (preference); SDK field must reflect iOS 27+.
+          if ! otool -l libShell.dylib | grep -E 'minos 14\.0|version 14\.0' >/dev/null; then
+            echo "[!] Expected min OS 14.0 in LC_BUILD_VERSION / LC_VERSION_MIN_IPHONEOS"
+            exit 1
+          fi
+          echo "[+] min OS 14.0 confirmed"
+          if ! otool -l libShell.dylib | grep -E 'sdk 27\.' >/dev/null; then
+            echo "[!] Expected sdk 27.x in LC_BUILD_VERSION (built with iOS 27 SDK)"
+            otool -l libShell.dylib | grep -A6 LC_BUILD_VERSION || true
+            exit 1
+          fi
+          echo "[+] LC_BUILD_VERSION sdk 27.x confirmed"
+
+      - name: Upload libShell.dylib artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libShell-dylib
+          path: libShell.dylib
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout (for ancestry check)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require tagged commit is on main
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "[!] Refusing Release: ${GITHUB_SHA} is not on origin/main"
+            exit 1
+          fi
+          echo "[+] Tagged commit ${GITHUB_SHA} is on origin/main"
+          echo "[+] Tag ${GITHUB_REF_NAME}"
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: libShell-dylib
+
+      - name: Publish Release with libShell.dylib
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -f libShell.dylib
+          # Do not create tags here — only attach a Release to the pushed tag.
+          # Failed builds never reach this job (needs: build).
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "[!] Release ${GITHUB_REF_NAME} already exists; uploading asset only if missing"
+            gh release upload "${GITHUB_REF_NAME}" libShell.dylib --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" libShell.dylib \
+              --title "${GITHUB_REF_NAME}" \
+              --generate-notes \
+              --verify-tag
+          fi

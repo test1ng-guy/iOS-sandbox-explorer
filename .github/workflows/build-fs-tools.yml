@@ -1,0 +1,46 @@
+# Restore + build F# host tooling (tools-fs/ise) and smoke self-tests.
+
+name: Build F# tools
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "tools-fs/**"
+      - "ise"
+      - ".github/workflows/build-fs-tools.yml"
+  pull_request:
+    paths:
+      - "tools-fs/**"
+      - "ise"
+      - ".github/workflows/build-fs-tools.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: dotnet build (net8.0)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Restore
+        run: dotnet restore tools-fs/ise.sln
+
+      - name: Build
+        run: dotnet build tools-fs/ise.sln -c Release --no-restore
+
+      - name: Smoke run via ./ise launcher
+        run: |
+          chmod +x ./ise
+          ./ise --self-test
+          ./ise --self-test-patcher
+          ./ise --self-test-devices

@@ -25,6 +25,7 @@ build/
 DerivedData/
 *.dSYM/
 *.dSYM.zip
+libShell.dylib
 
 # Temporary files
 *.tmp
@@ -102,4 +103,11 @@ yarn-error.log*
 
 # Temporary directories
 temp/
-tmp/tools/anisette_helper
+
+# .NET / F# (tools-fs)
+**/bin/
+**/obj/
+*.user
+*.suo
+.vs/
+*.DotSettings.user

@@ -1,6 +1,6 @@
 // ShellCommands.m — Expanded command set for iOS sandbox exploration
 // All commands implemented via Foundation/POSIX APIs — no popen(), no shell dependency
-// Compatible with iOS 14–26 sandbox restrictions
+// Compatible with iOS 14+ sandbox restrictions (deployment target 14.0)
 
 #import "ShellCommands.h"
 #import <Foundation/Foundation.h>
@@ -1510,7 +1510,7 @@ static NSString *permissionsString(NSUInteger posixPerms) {
 
     NSString *header = [NSString stringWithFormat:
         @"Keychain Dump — %ld item(s) found\n%@"
-        @"Access limited to this app's entitlement groups (re-sign with --jailbreak to expand)\n",
+        @"Access limited to this app's entitlement groups\n",
         (long)totalItems, filterNote];
 
     return [header stringByAppendingString:output];
@@ -1561,8 +1561,8 @@ static NSString *permissionsString(NSUInteger posixPerms) {
     }
 
     [out appendString:
-        @"\nNote: to dump items from OTHER app's groups on jailbreak,\n"
-        @"re-patch with --jailbreak flag (adds original keychain-access-groups to entitlements)\n"];
+        @"\nNote: readable items are limited to this app's keychain-access-groups.\n"
+        @"There is no --jailbreak patcher flag in this project.\n"];
 
     return out;
 }
@@ -1576,7 +1576,7 @@ static NSString *permissionsString(NSUInteger posixPerms) {
 + (NSString *)cmd_version {
     return @"iOS Sandbox Explorer v2.0\n"
            @"Shell server with built-in commands\n"
-           @"Compatible: iOS 14-26 (no popen/shell dependency)";
+           @"Compatible: iOS 14+ (no popen/shell dependency; min OS 14.0)";
 }
 
 + (NSString *)cmd_help {

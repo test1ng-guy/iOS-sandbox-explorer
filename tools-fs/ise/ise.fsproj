@@ -1,0 +1,23 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>IosSandboxExplorer</RootNamespace>
+    <AssemblyName>ise</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Client.fs" />
+    <Compile Include="MachO.fs" />
+    <Compile Include="Patcher.fs" />
+    <Compile Include="Device.fs" />
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="plist-cil" Version="2.2.0" />
+    <PackageReference Include="Netimobiledevice" Version="2.5.2" />
+  </ItemGroup>
+
+</Project>

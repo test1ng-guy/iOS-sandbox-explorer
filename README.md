@@ -1,169 +1,157 @@
 # iOS Sandbox Explorer
 
-Inject a custom DYLIB into any iOS app, sign it with a **free Apple ID** (no paid developer account), install it, and get interactive shell access to the app's sandbox over USB — on any device, jailbroken or not.
+### Overview and Workflow
 
-Built-in signing works the same way as **Sideloadly**: authenticates directly with Apple using SRP, obtains a free development certificate and provisioning profile, and signs your IPA — entirely from the command line. No Docker, no Xcode GUI.
+The **iOS Sandbox Explorer** lets you create a custom DYLIB, inject it into any iOS app, and interact with the app's sandbox through a simple USB tunnel. 
 
-## How It Works
+Once created, the resulting IPA can be signed using an external signer and installed onto your device. 
 
-1. **Build** `libShell.dylib` — an Objective-C TCP server with built-in sandbox-safe commands (no `popen`, no `exec`)
-2. **Patch** any IPA — inject the DYLIB, add network entitlements, update `Info.plist`
-3. **Sign** with a free Apple ID — no paid account, no Xcode GUI, works cross-platform
-4. **Install** directly to device via `ideviceinstaller`
-5. **Connect** via USB tunnel → run commands, dump keychain, download files from the app's sandbox
+After installing the app onto your device, you will have access to an interactive shell within the app's sandbox over a USB connection.
 
-## Architecture
+> [!TIP]
+> There are many ways to sign your IPA for free without requiring a Mac or being jailbroken; some examples include:
+> [Feather](https://github.com/claration/feather),  [ipasigner.com](https://www.ipasigner.com/), [Sideloadly](https://sideloadly.io/), [Zsign](https://github.com/zhlynn/zsign)
+
+> [!WARNING]
+> _This project does not provide support for Apple ID/GSA/anisette signing so you must use your own preferred method of signing._
+
+## Workflow
+
+The general workflow is as follows:
+
+1. Create libShell.dylib - A TCP server written in Objective-C that includes many built-in commands that are safe to run within the sandbox (i.e., no popen/no exec).
+
+2. Inject the DYLIB into any IPA, add network entitlements, update Info.plist, and produce a patched IPA ready to be signed.
+
+3. Sign the patched IPA using an external tool of your choice.
+
+4. Install the patched IPA onto your device (e.g., using ideviceinstaller or through your signer's installation process).
+
+5. Connect to the device via USB tunnel and execute the DYLIB's built-in commands — no popen(), no exec() (safe from iOS entitlement restrictions).
+
+dump the keychain, or download files directly from the app's sandbox.
+
+## Repository layout
 
 ```
-src/
-  main.m              — DYLIB entry point, starts TCP server
-  ShellServer.m       — TCP server (port 8080)
-  ShellCommands.m     — Built-in commands (sandbox-safe, no popen)
-include/
-  ShellServer.h
-  ShellCommands.h
-tools/
-  patcher.py          — Cross-platform IPA patcher (Windows / Linux / macOS)
-  apple_account.py    — Apple ID auth & signing (like Sideloadly, no paid account)
-  anisette_helper.m   — Native anisette provider for macOS (compiled on demand)
-ios-patch/
-  patch_ipa.sh        — Legacy macOS patching script
-client.py             — Python client for remote command execution
-Makefile              — Builds libShell.dylib (+ anisette_helper on macOS)
+ise                   — short launcher for F# host tools (./ise …)
+src/                  — libShell Objective-C sources
+include/              — public headers
+Makefile              — builds libShell.dylib (macOS + Xcode iphoneos SDK)
+tools-fs/ise/         — F# host tooling project (client, patch, devices, install, tunnel, full)
+.github/workflows/
+  build-dylib.yml     — macOS CI: build dylib on xcode-27 (iOS 27 SDK); Releases on v*.*.* tags
+  build-fs-tools.yml  — Linux CI: restore/build F# tools + self-tests
 ```
 
 ## Prerequisites
 
-### macOS
+### Build `libShell.dylib` (macOS)
+
+- Xcode with an **iphoneos** SDK (CI uses the **iOS 27** SDK on the `xcode-27` runner)
+- Deployment target stays **iOS 14.0** (`IPHONEOS_DEPLOYMENT_TARGET`)
 
 ```bash
-# Python & dependencies
-python3 -m pip install -r tools/requirements.txt
-
-# USB install / tunneling
-brew install libimobiledevice ideviceinstaller
-
-# DYLIB build (Xcode Command Line Tools)
-xcode-select --install
+xcode-select --install   # if needed
+make                     # → libShell.dylib
 ```
 
-### Linux (Ubuntu / Kali / Debian)
+Optional hard gate (matches CI):
 
 ```bash
-# Create and activate a virtual environment (recommended — avoids PEP 668 errors)
-python3 -m venv .venv
-source .venv/bin/activate
-
-# Install Python dependencies
-pip install -r tools/requirements.txt
-
-# USB install / tunneling
-sudo apt install libimobiledevice-utils ideviceinstaller
+REQUIRE_IOS_SDK_MAJOR=1 IPHONEOS_SDK_MIN_MAJOR=27 make
 ```
 
-> **Note:** Always activate the venv before running any tool command:
-> `source .venv/bin/activate`
-
-## Anisette Data (Apple Authentication)
-
-Apple requires "anisette" device-attestation headers for signing. This tool handles it **automatically** — no Docker required:
-
-| Platform | Provider | Setup |
-|---|---|---|
-| macOS | `NativeAnisetteProvider` via `AOSKit.framework` | Zero setup — uses system framework |
-| Linux (x86_64 / arm64 / armv7 / i686) | `LinuxAnisetteProvider` via [Anisette.py](https://github.com/malmeloo/Anisette.py) | Zero setup — pure Python (Unicorn emulation) |
-| Windows | HTTP fallback (`--anisette-url`) | Requires external anisette server |
-
-**macOS:** Calls `AOSUtilities.retrieveOTPHeadersForDSID:` directly — no Docker, no entitlement tricks.
-
-**Linux:** Uses [Anisette.py](https://github.com/malmeloo/Anisette.py), which emulates Apple's ARM64 ADI libraries entirely in Python via Unicorn Engine. First run downloads ~3 MB of Apple libs (cached in `~/.config/cc-ios/anisette/`). No Docker, no native binaries, no OpenSSL version conflicts.
-
-**Windows (manual):** Run an external anisette server and pass `--anisette-url http://localhost:6969`.
-
-## Building the DYLIB
+### Host tooling (any OS with .NET 8)
 
 ```bash
-make
+# .NET 8 SDK: https://dotnet.microsoft.com/download
+dotnet build tools-fs/ise.sln -c Release
+chmod +x ./ise   # once, if needed
 ```
 
-Creates `libShell.dylib` in the project root. On macOS, also builds `tools/anisette_helper` (the native anisette binary, compiled automatically on demand). You only need macOS for this step — use the pre-built binary from Releases on other platforms.
+### Device USB (install / tunnel / list)
 
-## Patching an IPA
+- A paired, trusted device
+- **usbmuxd** (Linux/macOS) or Apple Mobile Device Support (Windows)
+- F# device commands use [Netimobiledevice](https://github.com/artehe/Netimobiledevice)
+
+## Building / obtaining `libShell.dylib`
+
+`libShell.dylib` is **not** committed to git.
+
+| Source | Notes |
+|--------|--------|
+| `make` on macOS | Builds with current iphoneos SDK; min OS **14.0** |
+| [GitHub Releases](https://github.com/gemsloot-iOS/iOS-sandbox-explorer/releases) | Published only when a semver tag `v*.*.*` is pushed to a commit **on `main`** |
+| [Actions](https://github.com/gemsloot-iOS/iOS-sandbox-explorer/actions) artifact `libShell-dylib` | From workflow **Build libShell.dylib** (every push/PR; not a Release) |
+
+CI artifacts (`build-dylib.yml`):
+
+- Runner: **`xcode-27`** (real iOS **27** SDK; fails if SDK major &lt; 27)
+- Mach-O check: `minos 14.0` and `sdk 27.x`
+- Releases: tag push `v*.*.*` only — CI never creates tags
+
+## F# host tools
+
+Day-to-day commands use the root launcher **`./ise`** (wraps `tools-fs/ise`).
 
 ```bash
-python3 tools/patcher.py patch --ipa MyApp.ipa --dylib libShell.dylib
+# Shell client (TCP to libShell on device via tunnel)
+./ise "ls"
+./ise client "pwd" --host localhost --port 8080
+./ise "scp -r Documents host:./downloads"
+
+# Patch IPA (unsigned output)
+./ise patch --ipa MyApp.ipa --dylib libShell.dylib
 # → MyApp_patched.ipa
+
+# Device helpers (Netimobiledevice)
+./ise devices
+./ise install --ipa MyApp_signed.ipa [--udid UDID]
+./ise tunnel [--local-port 8080] [--remote-port 8080] [--udid UDID]
+
+# Patch then optionally install (still unsigned unless you signed first)
+./ise full --ipa MyApp.ipa --dylib libShell.dylib [--install] [--udid UDID]
+
+# Offline self-tests (also run in CI)
+./ise --self-test
+./ise --self-test-patcher
+./ise --self-test-devices
 ```
 
-Works on Windows, Linux, and macOS. No Xcode or `insert_dylib` required.
+Optional (advanced): `dotnet run --project tools-fs/ise -- …` does the same without `./ise`.
 
-## Signing with Apple ID
+`--use-lief` is accepted on `patch` / `full` for old-CLI compatibility; F# inject already reclaims `LC_CODE_SIGNATURE` space when needed (no Python `lief`).
 
-### One command: patch + sign + install
+## Sign externally, then install
 
 ```bash
-python3 tools/patcher.py full \
-  --ipa MyApp.ipa \
-  --dylib libShell.dylib \
-  --apple-id user@example.com \
-  --install \
-  --udid <device-udid>
+# After patch — sign with feather / ipasigner / Sideloadly / zsign / etc.
+# Then:
+./ise install --ipa MyApp_signed.ipa
 ```
 
-### Sign only (already patched IPA)
+## Connect and use
+
+1. Launch the patched app on the device (dylib starts a TCP server on **port 8080**, loopback on device).
+2. Start a USB tunnel:
 
 ```bash
-python3 tools/apple_account.py sign \
-  --ipa MyApp_patched.ipa \
-  -o MyApp_signed.ipa \
-  --udid <device-udid> \
-  --install
+./ise tunnel --local-port 8080 --remote-port 8080
+# foreground; Ctrl+C to stop
 ```
 
-You will be prompted for your Apple ID email and password. The password is **never saved to disk** — authentication uses Apple's SRP protocol.
+3. Run commands from the host (examples above).
 
-**Free account limitations:**
-- Apps expire in 7 days (re-sign weekly)
-- Max 3 App IDs per week
-- Max 10 sideloaded apps
+## Available commands (dylib)
 
-**Note:** If the app's bundle ID is taken by another developer, the tool automatically renames it to `<TEAM_ID>.<bundle.id>` and patches `Info.plist` accordingly.
+Implemented in-process via `Foundation/POSIX`
 
-## Installing on Device
+> [!TIP]
+> Full list: run `help` on the device shell.
 
-```bash
-# Standalone install (after signing)
-ideviceinstaller -u <device-udid> install MyApp_signed.ipa
-
-# Or use --install flag during signing (see above)
-```
-
-## Connecting and Using
-
-### 1. Launch the patched app on your device
-
-### 2. Set up USB tunnel
-
-```bash
-iproxy 8080 8080
-```
-
-### 3. Run commands
-
-```bash
-python3 client.py "ls"
-python3 client.py "pwd"
-python3 client.py "id"
-python3 client.py "uname"
-
-# Download files / directories from sandbox to host
-python3 client.py "scp -r Documents host:./downloads"
-python3 client.py "scp -r Library host:./library"
-```
-
-## Available Commands
-
-The DYLIB implements built-in commands — **no `popen()`, no `exec()`** (safe from iOS entitlement restrictions):
+Highlights:
 
 | Command | Description |
 |---------|-------------|
@@ -188,43 +176,34 @@ The DYLIB implements built-in commands — **no `popen()`, no `exec()`** (safe f
 | `keychain dump --filter self` | Dump keychain items matching the app's own bundle ID |
 | `keychain dump --class <type>` | Filter by item class: `generic`, `internet`, `cert`, `key` |
 
+> [!NOTE]
+> Keychain access is limited to what this app’s entitlements allow.
+
 ## Troubleshooting
 
 ### `Connection refused` on port 8080
-- Verify the patched app is running on device
-- Check `iproxy 8080 8080` is running
-- Try relaunching the app
 
-### Signing fails on Linux (first run is slow)
-- First run of Anisette.py downloads ~3 MB of Apple libs (cached in `~/.config/cc-ios/anisette/`)
-- Make sure the venv is active: `source .venv/bin/activate`
-- To reset anisette session: `python3 -c "from tools.apple_account import LinuxAnisetteProvider; LinuxAnisetteProvider.reset()"`
+- Patched app must be running
+- Tunnel must be up (`tunnel` or equivalent)
+- Relaunch the app after install
 
-### App rejected on install (`ApplicationVerificationFailed`)
-- Certificate expired — re-run the sign command to get a fresh cert
-- Make sure `--udid` matches the connected device
+### Install / device list fails
 
-### `ideviceinstaller not found`
-- macOS: `brew install ideviceinstaller`
-- Linux: `apt install ideviceinstaller`
-- Windows: [libimobiledevice-win32](https://github.com/libimobiledevice-win32/imobiledevice-net)
+- Device unlocked, trusted, and paired
+- usbmuxd / Apple Mobile Device Support running
+- IPA must be **signed** for the target device before `install` succeeds
 
-### `anisette_helper` build fails (macOS)
-- Ensure Xcode Command Line Tools are installed: `xcode-select --install`
-- The binary compiles automatically on first sign; or build manually: `make anisette_helper`
+### App rejected (`ApplicationVerificationFailed`)
 
-### Finding Signing Identity (legacy `patch_ipa.sh`)
+- Re-sign with a valid external cert / profile matching the device UDID
 
-Only needed if using the old `ios-patch/patch_ipa.sh` script directly:
+### `make` / iphoneos SDK errors
 
-```bash
-security find-identity -p codesigning -v
-# Look for "Apple Development: ..." identities
-```
+- Need macOS + Xcode with an iphoneos SDK
+- CI requires SDK major ≥ 27; locally, older SDKs may still build but will warn
 
-## Security Notes
+## Security notes
 
-- For testing and research purposes only
-- Injected code runs entirely within the app's sandbox
-- Network traffic is tunnelled over USB (never exposed to the network)
-- Apple ID password is never written to disk; authentication uses SRP
+- For testing and research only
+- Injected code runs inside the host app’s sandbox
+- Shell TCP is bound to loopback on device; reach it over USB tunnel, not the LAN

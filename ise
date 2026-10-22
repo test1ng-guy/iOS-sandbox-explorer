@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Short launcher for the F# host tools (iOS Sandbox Explorer).
+# Usage: ./ise devices | ./ise patch ... | ./ise tunnel | ./ise "ls"
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+PROJ="$ROOT/tools-fs/ise/ise.fsproj"
+DLL_RELEASE="$ROOT/tools-fs/ise/bin/Release/net8.0/ise.dll"
+DLL_DEBUG="$ROOT/tools-fs/ise/bin/Debug/net8.0/ise.dll"
+
+if ! command -v dotnet >/dev/null 2>&1; then
+  echo "ise: dotnet not found. Install the .NET 8 SDK: https://dotnet.microsoft.com/download" >&2
+  exit 127
+fi
+
+if [[ ! -f "$PROJ" ]]; then
+  echo "ise: missing project at $PROJ" >&2
+  exit 1
+fi
+
+# Prefer an already-built assembly (fast). Fall back to dotnet run.
+if [[ -f "$DLL_RELEASE" ]]; then
+  exec dotnet "$DLL_RELEASE" "$@"
+fi
+if [[ -f "$DLL_DEBUG" ]]; then
+  exec dotnet "$DLL_DEBUG" "$@"
+fi
+
+exec dotnet run --project "$PROJ" -c Release -- "$@"
